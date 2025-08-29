@@ -1,10 +1,12 @@
 //! Hash-based multilinear PCS for Spartan2 (Track A)
 //! 
 //! This implementation provides a Merkle tree-based polynomial commitment scheme
-//! for multilinear polynomials using Keccak256 hashing. It supports LeakReduced mode
+//! for multilinear polynomials using configurable hashing backends. It supports LeakReduced mode
 //! which reveals O(m) dense fold values during evaluation.
 //!
-//! TODO: Upgrade to Poseidon2 for ZK-friendly hashing with better circuit performance.
+//! Backends available:
+//! - Keccak256 (default, ff-based)
+//! - Poseidon2 with p3-goldilocks (feature-gated)
 
 use crate::{
   errors::SpartanError,
@@ -17,14 +19,19 @@ use crate::{
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use sha3::{Digest, Keccak256};
 use std::marker::PhantomData;
 
+// Import backend interface
+use super::hash_mle_backend::{MleBackend, BackendFfKeccak, Digest32};
+
 /// Domain tags to avoid cross-protocol collisions
+#[allow(dead_code)]
 const TAG_LEAF: &[u8] = b"mle/leaf";
+#[allow(dead_code)]
 const TAG_NODE: &[u8] = b"mle/node";
 const TAG_MODE: &[u8] = b"mle/mode";
-const TAG_LAYER_ROOTS: &[u8] = b"mle/layer_roots";
+/// Tag used for layer roots in the transcript
+pub const TAG_LAYER_ROOTS: &[u8] = b"mle/layer_roots";
 
 /// Zero-knowledge mode for the Hash-MLE PCS
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,23 +44,27 @@ pub enum ZkMode {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HashMleCommitmentKey<E: Engine> {
   /// Merkle arity (currently fixed to 2)
-  branching: u8,
+  pub branching: u8,
   /// ZK mode baked into this key
-  zk_mode: ZkMode,
-  _p: PhantomData<E>,
+  pub zk_mode: ZkMode,
+  /// Phantom data for the engine type
+  pub _p: PhantomData<E>,
 }
 
 /// Verifier key for Hash-MLE PCS
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HashMleVerifierKey<E: Engine> {
-  branching: u8,
-  zk_mode: ZkMode,
-  _p: PhantomData<E>,
+  /// Branching factor of the Merkle tree
+  pub branching: u8,
+  /// Zero-knowledge mode
+  pub zk_mode: ZkMode,
+  /// Phantom data for the engine type
+  pub _p: PhantomData<E>,
 }
 
 /// A Merkle tree root (32-byte hash)
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MerkleRoot([u8; 32]);
+pub struct MerkleRoot(pub [u8; 32]);
 
 impl<G: crate::traits::Group> TranscriptReprTrait<G> for MerkleRoot {
   fn to_transcript_bytes(&self) -> Vec<u8> {
@@ -81,10 +92,11 @@ pub struct MerklePath {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HashMleCommitment<E: Engine> {
   /// Root of the base vector commitment (unmasked v in LeakReduced mode)
-  base_root: MerkleRoot,
+  pub base_root: MerkleRoot,
   /// Mode encoded into the commitment to avoid misuse across modes
-  mode: ZkMode,
-  _p: PhantomData<E>,
+  pub mode: ZkMode,
+  /// Phantom data for the engine type
+  pub _p: PhantomData<E>,
 }
 
 impl<E: Engine> TranscriptReprTrait<E::GE> for HashMleCommitment<E> {
@@ -115,10 +127,10 @@ impl<E: Engine> Default for HashMleBlind<E> {
 #[derive(Clone, Debug)]
 pub struct HashMleEvaluationArgument<E: Engine> {
   /// Layer roots carried here to avoid bloating the commitment
-  layer_roots: Vec<MerkleRoot>, // len = m+1
+  pub layer_roots: Vec<MerkleRoot>, // len = m+1
 
   /// For each round i in [0..m):
-  rounds: Vec<Round<E>>,
+  pub rounds: Vec<Round<E>>,
 }
 
 impl<E: Engine> serde::Serialize for HashMleEvaluationArgument<E> {
@@ -195,48 +207,48 @@ impl<'de, E: Engine> serde::Deserialize<'de> for HashMleEvaluationArgument<E> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Round<E: Engine> {
   /// openings from layer i (v^{(i)}):
-  a: E::Scalar,         // even
-  b: E::Scalar,         // odd
-  path_a: MerklePath,   // membership against layer_roots[i]
-  path_b: MerklePath,   // membership against layer_roots[i]
+  /// Even evaluation value
+  pub a: E::Scalar,         // even
+  /// Odd evaluation value
+  pub b: E::Scalar,         // odd
+  /// Merkle path for even evaluation
+  pub path_a: MerklePath,   // membership against layer_roots[i]
+  /// Merkle path for odd evaluation
+  pub path_b: MerklePath,   // membership against layer_roots[i]
 
   /// membership for layer i+1 at the folded index
-  next: E::Scalar,      // equals (1-r_i)*a + r_i*b
-  path_next: MerklePath // membership against layer_roots[i+1]
+  /// Folded value for next layer (equals (1-r_i)*a + r_i*b)
+  pub next: E::Scalar,      // equals (1-r_i)*a + r_i*b
+  /// Merkle path for the next layer
+  pub path_next: MerklePath // membership against layer_roots[i+1]
 }
 
-/// Minimal Merkle helper (binary). We keep it local to avoid extra deps.
-fn keccak256(bytes: &[u8]) -> [u8; 32] {
-  let mut h = Keccak256::new();
-  h.update(bytes);
-  h.finalize().into()
+// Default backend type alias for backwards compatibility
+type DefaultBackend<E> = BackendFfKeccak<E>;
+
+/// Generic hash functions that use the backend
+/// Hash a leaf field element into a 32-byte digest using the specified backend
+pub fn leaf_digest<E: Engine, B: MleBackend<E>>(x: &B::FE) -> Digest32 { 
+  B::leaf_hash(x) 
 }
 
-fn leaf_hash<E: Engine>(x: &E::Scalar) -> [u8; 32] {
-  let mut v = Vec::with_capacity(TAG_LEAF.len() + 64);
-  v.extend_from_slice(TAG_LEAF);
-  v.extend_from_slice(&x.to_transcript_bytes());
-  keccak256(&v)
+/// Hash two child digests into a parent digest using the specified backend
+pub fn node_digest<E: Engine, B: MleBackend<E>>(l: &Digest32, r: &Digest32) -> Digest32 { 
+  B::node_hash(l, r) 
 }
 
-fn node_hash(l: &[u8; 32], r: &[u8; 32]) -> [u8; 32] {
-  let mut v = Vec::with_capacity(TAG_NODE.len() + 64);
-  v.extend_from_slice(TAG_NODE);
-  v.extend_from_slice(l);
-  v.extend_from_slice(r);
-  keccak256(&v)
-}
-
+/// Merkle tree implementation using configurable hash backends
 #[derive(Clone)]
-struct MerkleTree {
+pub struct MerkleTree {
   /// bottom layer (leaves), power of two
   #[allow(dead_code)]
-  leaves: Vec<[u8; 32]>,
-  layers: Vec<Vec<[u8; 32]>>, // including leaves; layers[0] == leaves, layers.last()[0] == root
+  leaves: Vec<Digest32>,
+  layers: Vec<Vec<Digest32>>, // including leaves; layers[0] == leaves, layers.last()[0] == root
 }
 
 impl MerkleTree {
-  fn from_leaves(leaves: Vec<[u8; 32]>) -> Self {
+  /// Create a new Merkle tree from leaf digests using the specified backend
+  pub fn from_leaves<E: Engine, B: MleBackend<E>>(leaves: Vec<Digest32>) -> Self {
     assert!(leaves.len().is_power_of_two());
     let mut layers = Vec::new();
     let mut cur = leaves.clone();
@@ -245,7 +257,7 @@ impl MerkleTree {
     while cur.len() > 1 {
       cur = cur
         .chunks_exact(2)
-        .map(|p| node_hash(&p[0], &p[1]))
+        .map(|p| node_digest::<E, B>(&p[0], &p[1]))
         .collect::<Vec<_>>();
       layers.push(cur.clone());
     }
@@ -253,11 +265,13 @@ impl MerkleTree {
     Self { leaves, layers }
   }
   
-  fn root(&self) -> [u8; 32] { 
-    *self.layers.last().unwrap().first().unwrap() 
+  /// Get the root digest of the Merkle tree
+  pub fn root(&self) -> Digest32 { 
+    self.layers.last().unwrap()[0]
   }
   
-  fn open(&self, leaf_index: usize) -> MerklePath {
+  /// Generate a Merkle proof for the leaf at the given index
+  pub fn open(&self, leaf_index: usize) -> MerklePath {
     let mut idx = leaf_index;
     let mut siblings = Vec::with_capacity(self.layers.len() - 1);
     
@@ -270,7 +284,7 @@ impl MerkleTree {
       } else { 
         layer[idx - 1] 
       };
-      siblings.push(sib);
+      siblings.push(sib.0);
       idx >>= 1;
     }
     
@@ -280,20 +294,22 @@ impl MerkleTree {
     }
   }
   
-  fn verify(path: &MerklePath, leaf: &[u8; 32], root: &[u8; 32]) -> bool {
+  /// Verify a Merkle proof using the specified backend
+  pub fn verify<E: Engine, B: MleBackend<E>>(path: &MerklePath, leaf: &Digest32, root: &Digest32) -> bool {
     let mut idx = path.leaf_index as usize;
     let mut cur = *leaf;
     
     for sib in &path.siblings {
+      let sib_digest = Digest32(*sib);
       cur = if idx % 2 == 0 { 
-        node_hash(&cur, sib) 
+        node_digest::<E, B>(&cur, &sib_digest) 
       } else { 
-        node_hash(sib, &cur) 
+        node_digest::<E, B>(&sib_digest, &cur) 
       };
       idx >>= 1;
     }
     
-    &cur == root
+    cur == *root
   }
 }
 
@@ -360,9 +376,16 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePCS<E> {
     }
     
     // Base layer leaves (unmasked in LeakReduced mode)
-    let leaves = v.par_iter().map(leaf_hash::<E>).collect::<Vec<_>>();
-    let tree = MerkleTree::from_leaves(leaves);
-    let base_root = MerkleRoot(tree.root());
+    let leaves = v
+      .par_iter()
+      .map(|x_ff| {
+        // Default backend uses E::Scalar directly
+        let x_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(x_ff);
+        leaf_digest::<E, DefaultBackend<E>>(&x_fe)
+      })
+      .collect::<Vec<_>>();
+    let tree = MerkleTree::from_leaves::<E, DefaultBackend<E>>(leaves);
+    let base_root = MerkleRoot(tree.root().0);
 
     Ok(HashMleCommitment { 
       base_root, 
@@ -443,10 +466,19 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePCS<E> {
     // Build trees + roots (per-proof) and round proofs
     let trees: Vec<MerkleTree> = all_layers
       .par_iter()
-      .map(|lvl| MerkleTree::from_leaves(lvl.par_iter().map(leaf_hash::<E>).collect()))
+      .map(|lvl| {
+        let leaves = lvl
+          .par_iter()
+          .map(|x_ff| {
+            let x_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(x_ff);
+            leaf_digest::<E, DefaultBackend<E>>(&x_fe)
+          })
+          .collect();
+        MerkleTree::from_leaves::<E, DefaultBackend<E>>(leaves)
+      })
       .collect();
 
-    let layer_roots: Vec<MerkleRoot> = trees.iter().map(|t| MerkleRoot(t.root())).collect();
+    let layer_roots: Vec<MerkleRoot> = trees.iter().map(|t| MerkleRoot(t.root().0)).collect();
 
     // For each round, we open the correct pairs based on MultilinearPolynomial's folding
     // NOTE: We also absorb layer roots here for transcript symmetry (verifier does the same).
@@ -542,10 +574,13 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePCS<E> {
         return Err(SpartanError::InvalidPCS);
       }
 
-      let a_h = leaf_hash::<E>(&arg.rounds[i].a);
-      let b_h = leaf_hash::<E>(&arg.rounds[i].b);
-      if !MerkleTree::verify(&arg.rounds[i].path_a, &a_h, root_i) ||
-         !MerkleTree::verify(&arg.rounds[i].path_b, &b_h, root_i) {
+      let a_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(&arg.rounds[i].a);
+      let b_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(&arg.rounds[i].b);
+      let a_h = leaf_digest::<E, DefaultBackend<E>>(&a_fe);
+      let b_h = leaf_digest::<E, DefaultBackend<E>>(&b_fe);
+      let root_i_digest = Digest32(*root_i);
+      if !MerkleTree::verify::<E, DefaultBackend<E>>(&arg.rounds[i].path_a, &a_h, &root_i_digest) ||
+         !MerkleTree::verify::<E, DefaultBackend<E>>(&arg.rounds[i].path_b, &b_h, &root_i_digest) {
         return Err(SpartanError::InvalidPCS);
       }
 
@@ -554,8 +589,10 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePCS<E> {
         return Err(SpartanError::InvalidPCS);
       }
 
-      let next_h = leaf_hash::<E>(&arg.rounds[i].next);
-      if !MerkleTree::verify(&arg.rounds[i].path_next, &next_h, root_ip1) {
+      let next_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(&arg.rounds[i].next);
+      let next_h = leaf_digest::<E, DefaultBackend<E>>(&next_fe);
+      let root_ip1_digest = Digest32(*root_ip1);
+      if !MerkleTree::verify::<E, DefaultBackend<E>>(&arg.rounds[i].path_next, &next_h, &root_ip1_digest) {
         return Err(SpartanError::InvalidPCS);
       }
     }
@@ -689,14 +726,14 @@ mod tests {
   fn test_merkle_tree_operations() {
     // Test the internal Merkle tree functionality
     let leaves = vec![
-      [1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]
+      Digest32([1u8; 32]), Digest32([2u8; 32]), Digest32([3u8; 32]), Digest32([4u8; 32])
     ];
-    let tree = MerkleTree::from_leaves(leaves.clone());
+    let tree = MerkleTree::from_leaves::<E, DefaultBackend<E>>(leaves.clone());
     
     // Test opening and verification
     for i in 0..leaves.len() {
       let path = tree.open(i);
-      assert!(MerkleTree::verify(&path, &leaves[i], &tree.root()));
+      assert!(MerkleTree::verify::<E, DefaultBackend<E>>(&path, &leaves[i], &tree.root()));
     }
   }
 
@@ -807,26 +844,39 @@ mod tests {
     let b0 = poly[j0 + half0];
     let next0 = a0 + point[0] * (b0 - a0);
     // Trees for L0..L3, each with only the constraint that index 0 equals our chosen "next"
-    let leaves0 = poly.iter().map(|x| leaf_hash::<E>(x)).collect::<Vec<_>>();
-    let t0 = MerkleTree::from_leaves(leaves0);
-    let root0 = MerkleRoot(t0.root());
+    let leaves0 = poly.iter().map(|x| {
+      let x_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(x);
+      leaf_digest::<E, DefaultBackend<E>>(&x_fe)
+    }).collect::<Vec<_>>();
+    let t0 = MerkleTree::from_leaves::<E, DefaultBackend<E>>(leaves0);
+    let root0 = MerkleRoot(t0.root().0);
 
     let l1 = vec![next0, <E as Engine>::Scalar::ZERO, <E as Engine>::Scalar::ZERO, <E as Engine>::Scalar::ZERO];
-    let t1 = MerkleTree::from_leaves(l1.iter().map(leaf_hash::<E>).collect());
-    let root1 = MerkleRoot(t1.root());
+    let leaves1 = l1.iter().map(|x| {
+      let x_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(x);
+      leaf_digest::<E, DefaultBackend<E>>(&x_fe)
+    }).collect::<Vec<_>>();
+    let t1 = MerkleTree::from_leaves::<E, DefaultBackend<E>>(leaves1);
+    let root1 = MerkleRoot(t1.root().0);
     let a1 = l1[0];
     let b1 = l1[2];
     let next1 = a1 + point[1] * (b1 - a1);
 
     let l2 = vec![next1, <E as Engine>::Scalar::ZERO];
-    let t2 = MerkleTree::from_leaves(l2.iter().map(leaf_hash::<E>).collect());
-    let root2 = MerkleRoot(t2.root());
+    let leaves2 = l2.iter().map(|x| {
+      let x_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(x);
+      leaf_digest::<E, DefaultBackend<E>>(&x_fe)
+    }).collect::<Vec<_>>();
+    let t2 = MerkleTree::from_leaves::<E, DefaultBackend<E>>(leaves2);
+    let root2 = MerkleRoot(t2.root().0);
     let a2 = l2[0];
     let b2 = l2[1];
     let next2 = a2 + point[2] * (b2 - a2);
 
-    let t3 = MerkleTree::from_leaves(vec![leaf_hash::<E>(&next2)]);
-    let root3 = MerkleRoot(t3.root());
+    let next2_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(&next2);
+    let next2_digest = leaf_digest::<E, DefaultBackend<E>>(&next2_fe);
+    let t3 = MerkleTree::from_leaves::<E, DefaultBackend<E>>(vec![next2_digest]);
+    let root3 = MerkleRoot(t3.root().0);
 
     // Assemble a forged argument (note: indices j0 and j0+half0 at layer 0)
     let arg = HashMleEvaluationArgument {

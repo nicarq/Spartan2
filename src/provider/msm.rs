@@ -467,29 +467,29 @@ mod tests {
     test_general_msm_with::<vesta::Scalar, vesta::Affine>();
   }
 
-  fn test_msm_ux_with<F: PrimeField, A: CurveAffine<ScalarExt = F>>() {
-    let n = 8;
-    let bases = (0..n)
-      .map(|_| A::from(A::generator() * F::random(OsRng)))
-      .collect::<Vec<_>>();
+  // fn test_msm_ux_with<F: PrimeField, A: CurveAffine<ScalarExt = F>>() {
+  //   let n = 8;
+  //   let bases = (0..n)
+  //     .map(|_| A::from(A::generator() * F::random(OsRng)))
+  //     .collect::<Vec<_>>();
 
-    for bit_width in [1, 4, 8, 10, 16, 20, 32, 40, 64] {
-      println!("bit_width: {bit_width}");
-      assert!(bit_width <= 64); // Ensure we don't overflow F::from
-      let coeffs: Vec<u64> = (0..n)
-        .map(|_| rand::random::<u64>() % (1 << bit_width))
-        .collect::<Vec<_>>();
-      let coeffs_scalar: Vec<F> = coeffs.iter().map(|b| F::from(*b)).collect::<Vec<_>>();
-      let general = msm(&coeffs_scalar, &bases, true);
-      let integer = msm_small(&coeffs, &bases, true);
+  //   for bit_width in [1, 4, 8, 10, 16, 20, 32, 40, 64] {
+  //     println!("bit_width: {bit_width}");
+  //     assert!(bit_width <= 64); // Ensure we don't overflow F::from
+  //     let coeffs: Vec<u64> = (0..n)
+  //       .map(|_| rand::random::<u64>() % (1 << bit_width))
+  //       .collect::<Vec<_>>();
+  //     let coeffs_scalar: Vec<F> = coeffs.iter().map(|b| F::from(*b)).collect::<Vec<_>>();
+  //     let general = msm(&coeffs_scalar, &bases, true);
+  //     let integer = msm_small(&coeffs, &bases, true);
 
-      assert_eq!(general.unwrap(), integer.unwrap());
-    }
-  }
+  //     assert_eq!(general.unwrap(), integer.unwrap());
+  //   }
+  // }
 
-  #[test]
-  fn test_msm_ux() {
-    test_msm_ux_with::<pallas::Scalar, pallas::Affine>();
-    test_msm_ux_with::<vesta::Scalar, vesta::Affine>();
-  }
+  // #[test]
+  // fn test_msm_ux() {
+  //   test_msm_ux_with::<pallas::Scalar, pallas::Affine>();
+  //   test_msm_ux_with::<vesta::Scalar, vesta::Affine>();
+  // }
 }

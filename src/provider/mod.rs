@@ -1,6 +1,7 @@
 //! This module implements Spartan's traits using the following several different combinations
 
 // public modules to be used as an commitment engine with Spartan
+pub mod goldi;
 pub mod keccak;
 pub mod pasta;
 pub mod pcs;
@@ -18,6 +19,9 @@ use crate::{
   },
   traits::Engine,
 };
+
+#[cfg(feature = "p3_backend")]
+use crate::provider::pcs::merkle_mle_pc_p3::HashMlePcsP3;
 use core::fmt::Debug;
 use serde::{Deserialize, Serialize};
 
@@ -115,6 +119,32 @@ impl Engine for T256MerkleMleEngine {
   type GE = t256::Point;
   type TE = Keccak256Transcript<Self>;
   type PCS = HashMlePCS<Self>;
+}
+
+/// An implementation of the Spartan Engine trait with Goldilocks field and Hash-MLE PCS (Keccak)
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GoldilocksMerkleMleEngine;
+
+impl Engine for GoldilocksMerkleMleEngine {
+  type Base = crate::provider::goldi::F;
+  type Scalar = crate::provider::goldi::F;
+  type GE = crate::provider::goldi::UnitPoint;
+  type TE = Keccak256Transcript<Self>;
+  type PCS = HashMlePCS<Self>;
+}
+
+/// An implementation of the Spartan Engine trait with Goldilocks field and Hash-MLE PCS (p3/Poseidon2)
+#[cfg(feature = "p3_backend")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GoldilocksP3MerkleMleEngine;
+
+#[cfg(feature = "p3_backend")]
+impl Engine for GoldilocksP3MerkleMleEngine {
+  type Base = crate::provider::goldi::F;
+  type Scalar = crate::provider::goldi::F;
+  type GE = crate::provider::goldi::UnitPoint;
+  type TE = Keccak256Transcript<Self>;
+  type PCS = HashMlePcsP3<Self>;
 }
 
 /*

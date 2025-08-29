@@ -36,6 +36,14 @@ once_cell = "1.18.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "time"] }
 
+# Plonky3 / p3 field + Poseidon2 for Goldilocks
+p3-field       = { version = "0.3", optional = true }
+p3-goldilocks = { version = "0.3", optional = true }
+p3-poseidon2   = { version = "0.3", optional = true }
+p3-symmetric   = { version = "0.3", optional = true }
+rand = { version = "0.8", optional = true }
+rand_chacha = "0.3"
+
 [target.wasm32-unknown-unknown.dependencies]
 # see https://github.com/rust-random/rand/pull/948
 getrandom = { version = "0.2.0", default-features = false, features = ["js"] }
@@ -48,7 +56,8 @@ sha2 = "0.10.7"
 proptest = "1.2.0"
 
 [features]
-default = []
+default = ["p3_backend"]
+p3_backend = ["p3-field", "p3-goldilocks", "p3-poseidon2", "p3-symmetric", "rand"]
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 halo2curves = { version = "0.9.0", features = ["derive_serde", "std", "asm"] }

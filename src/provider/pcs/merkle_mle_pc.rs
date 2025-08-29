@@ -3,6 +3,8 @@
 //! This implementation provides a Merkle tree-based polynomial commitment scheme
 //! for multilinear polynomials using Keccak256 hashing. It supports LeakReduced mode
 //! which reveals O(m) dense fold values during evaluation.
+//!
+//! TODO: Upgrade to Poseidon2 for ZK-friendly hashing with better circuit performance.
 
 use crate::{
   errors::SpartanError,

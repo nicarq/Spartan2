@@ -41,15 +41,15 @@ p3-field       = { version = "0.3", optional = true }
 p3-goldilocks = { version = "0.3", optional = true }
 p3-poseidon2   = { version = "0.3", optional = true }
 p3-symmetric   = { version = "0.3", optional = true }
-rand = { version = "0.8", optional = true }
-rand_chacha = "0.3"
+rand = { version = "0.9", optional = true }
+rand_chacha = "0.9"
 
 [target.wasm32-unknown-unknown.dependencies]
 # see https://github.com/rust-random/rand/pull/948
 getrandom = { version = "0.2.0", default-features = false, features = ["js"] }
 
 [dev-dependencies]
-rand = "0.8.4"
+rand = "0.9"
 hex = "0.4.3"
 cfg-if = "1.0.0"
 sha2 = "0.10.7"

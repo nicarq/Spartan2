@@ -13,7 +13,41 @@ use p3_goldilocks::Goldilocks as GF;
 #[cfg(feature = "p3_backend")]
 use p3_field::{PrimeCharacteristicRing, PrimeField64, integers::QuotientMap};
 
+#[cfg(feature = "p3_backend")]
+use p3_goldilocks::Poseidon2Goldilocks;
 
+#[cfg(feature = "p3_backend")]
+use p3_symmetric::Permutation;
+
+#[cfg(feature = "p3_backend")]
+use once_cell::sync::Lazy;
+
+#[cfg(feature = "p3_backend")]
+use rand::SeedableRng;
+#[cfg(feature = "p3_backend")]
+use rand_chacha::ChaCha8Rng;
+
+/// Poseidon2 width (Goldilocks, 64-bit prime). Supported: {8,12,16}. We use 12 to fit domain+len+8 words.
+#[cfg(feature = "p3_backend")]
+const POSEIDON2_WIDTH: usize = 12;
+
+/// Fixed seed to derive round constants deterministically (reproducible hash).
+/// Change only if you intentionally rotate parameters.
+#[cfg(feature = "p3_backend")]
+const POSEIDON2_PARAM_SEED_V1: u64 = 0x5_7045_3F1A_CB7D_12;
+
+#[cfg(feature = "p3_backend")]
+static POSEIDON2_GOLDI_12: Lazy<Poseidon2Goldilocks<POSEIDON2_WIDTH>> = Lazy::new(|| {
+    // Deterministic constants for stable hashing across runs.
+    let mut rng = ChaCha8Rng::seed_from_u64(POSEIDON2_PARAM_SEED_V1);
+    Poseidon2Goldilocks::<POSEIDON2_WIDTH>::new_from_rng_128(&mut rng)
+});
+
+/// Domain tags injected into state[0] to separate distinct uses.
+#[cfg(feature = "p3_backend")]
+const DOMAIN_LEAF: u64 = 0x_6C65_6166_2F6D_6C65; // ASCII-ish "leaf/mle" (little-endian as u64)
+#[cfg(feature = "p3_backend")]
+const DOMAIN_NODE: u64 = 0x_6E6F_6465_2F6D_6C65; // ASCII-ish "node/mle"
 
 /// 32-byte digest used by the Merkle tree / commitment
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,7 +156,7 @@ where
   }
 
   fn node_hash(l: &Digest32, r: &Digest32) -> Digest32 {
-    // Interpret each 32-byte digest as four LE u64s, then map to GF consistently
+    // Interpret each 32-byte digest as four LE u64s → Goldilocks words
     let mut limbs: [GF; 8] = [GF::ZERO; 8];
     for (i, d) in [l, r].iter().enumerate() {
       for j in 0..4 {
@@ -135,88 +169,74 @@ where
   }
 }
 
-/// Poseidon2-style hash with proper domain separation for p3 backend
-/// This uses p3 field arithmetic and domain separation, providing a different
-/// hash function from the FF/Keccak backend while we work on full p3-poseidon2 integration
+/// Compress first 4 state words into 32 bytes (LE u64 each).
 #[cfg(feature = "p3_backend")]
-fn poseidon2_hash_with_domain(domain: &[u8], inputs: &[GF]) -> Digest32 {
-    // Use a simple but cryptographically sound approach:
-    // 1. Domain separation via different constants
-    // 2. p3 field arithmetic throughout
-    // 3. Different structure from Keccak to ensure backend differentiation
-    
-    let mut state = [GF::ZERO; 4];
-    
-    // Domain separation: different constants for different domains
-    let domain_constant = match domain {
-        b"poseidon2/mle/leaf" => GF::from_int(0x1337_BEEF_DEAD_CAFEu64),
-        b"poseidon2/mle/node" => GF::from_int(0xCAFE_BABE_FEED_FACEu64),
-        _ => {
-            // Generic domain separation for other domains
-            let mut hash = 0u64;
-            for (i, &byte) in domain.iter().enumerate() {
-                hash = hash.wrapping_mul(31).wrapping_add(byte as u64);
-                if i >= 7 { break; } // Limit to avoid overflow
-            }
-            GF::from_int(hash)
-        }
-    };
-    
-    state[0] = domain_constant;
-    state[1] = GF::from_int(inputs.len() as u64);
-    
-    // Absorb inputs using p3 field arithmetic
-    let mut pos = 2;
-    for &input in inputs {
-        if pos >= 4 {
-            // Simple mixing when state is full - this is a placeholder for full Poseidon2
-            for i in 0..4 {
-                state[i] = state[i] + state[(i + 1) % 4] * GF::from_int(0x1000_0000_0000_0001 + i as u64);
-            }
-            pos = 0;
-        }
-        state[pos] = state[pos] + input;
-        pos += 1;
+#[inline]
+fn state4_to_digest32(state: &[GF; POSEIDON2_WIDTH]) -> Digest32 {
+    let mut out = [0u8; 32];
+    for i in 0..4 {
+        out[i * 8..(i + 1) * 8].copy_from_slice(&state[i].as_canonical_u64().to_le_bytes());
     }
-    
-    // Final mixing - simplified version of Poseidon2 round
-    for _ in 0..8 {
-        for i in 0..4 {
-            // S-box: x^7 (Poseidon2's S-box)
-            let x = state[i];
-            let x2 = x * x;
-            let x4 = x2 * x2;
-            state[i] = x4 * x2 * x; // x^7
-        }
-        
-        // Linear layer (simplified MDS matrix)
-        let s0 = state[0];
-        let s1 = state[1];
-        let s2 = state[2];
-        let s3 = state[3];
-        
-        state[0] = s0 + s1 + s2 + s3;
-        state[1] = s0 + s1 * GF::from_int(2) + s2 + s3;
-        state[2] = s0 + s1 + s2 * GF::from_int(3) + s3;
-        state[3] = s0 + s1 + s2 + s3 * GF::from_int(4);
-    }
-    
-    // Extract 32 bytes from the 4 field elements
-    let mut result = [0u8; 32];
-    for (i, &elem) in state.iter().enumerate() {
-        let bytes = elem.as_canonical_u64().to_le_bytes();
-        result[i*8..(i+1)*8].copy_from_slice(&bytes);
-    }
-    
-    Digest32(result)
+    Digest32(out)
 }
 
+/// Hash a single Goldilocks element as a Poseidon2 leaf.
+/// State layout (width=12):
+///   s[0] = DOMAIN_LEAF
+///   s[1] = len = 1
+///   s[2] = x
+///   s[3..] = 0
 #[cfg(feature = "p3_backend")]
+#[inline]
 fn poseidon2_hash_leaf(x: GF) -> Digest32 {
-    poseidon2_hash_with_domain(b"poseidon2/mle/leaf", core::slice::from_ref(&x))
+    let mut s = [GF::ZERO; POSEIDON2_WIDTH];
+    s[0] = GF::from_int(DOMAIN_LEAF);
+    s[1] = GF::from_int(1);
+    s[2] = x;
+    POSEIDON2_GOLDI_12.permute_mut(&mut s);
+    state4_to_digest32(&s)
 }
 
+/// Hash two child digests into a parent digest.
+/// Each child digest (32 bytes) is split into four LE u64s → Goldilocks words.
+/// We expect exactly 8 words: [l0..l3, r0..r3].
+/// State layout (width=12):
+///   s[0] = DOMAIN_NODE
+///   s[1] = len = 8
+///   s[2..10] = words[0..8]
+///   s[10..] = 0
 #[cfg(feature = "p3_backend")]
+#[inline]
 fn poseidon2_hash_node(words: &[GF]) -> Digest32 {
-    poseidon2_hash_with_domain(b"poseidon2/mle/node", words)
+    debug_assert_eq!(words.len(), 8, "node hash expects 8 Goldilocks words");
+    let mut s = [GF::ZERO; POSEIDON2_WIDTH];
+    s[0] = GF::from_int(DOMAIN_NODE);
+    s[1] = GF::from_int(8);
+    for i in 0..8 {
+        s[2 + i] = words[i];
+    }
+    POSEIDON2_GOLDI_12.permute_mut(&mut s);
+    state4_to_digest32(&s)
+}
+
+#[cfg(all(test, feature = "p3_backend"))]
+mod poseidon2_sanity_tests {
+    use super::*;
+
+    #[test]
+    fn poseidon2_leaf_is_deterministic() {
+        let x = GF::from_int(123456789);
+        let d1 = poseidon2_hash_leaf(x);
+        let d2 = poseidon2_hash_leaf(x);
+        assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn poseidon2_node_is_deterministic() {
+        let mut w = [GF::ZERO; 8];
+        for i in 0..8 { w[i] = GF::from_int(i as u64 + 1); }
+        let d1 = poseidon2_hash_node(&w);
+        let d2 = poseidon2_hash_node(&w);
+        assert_eq!(d1, d2);
+    }
 }

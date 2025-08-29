@@ -9,7 +9,6 @@ use crate::{
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use ff::PrimeField;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Hash-MLE PCS implementation using p3/Goldilocks + Poseidon2 backend
@@ -146,9 +145,8 @@ where
       let mut round_samples = Vec::with_capacity(K_SAMPLES_PER_ROUND);
       
       for _j in 0..K_SAMPLES_PER_ROUND {
-        // Derive random index from transcript
-        let s = transcript.squeeze(b"mle/fold_sample")?;
-        let idx = (s.to_repr().as_ref()[0] as usize) % stride;
+        // Derive random index from transcript (unbiased)
+        let idx = super::merkle_mle_pc::draw_index::<E>(transcript, b"mle/fold_sample", stride)?;
         
         let a = layers[i][idx];
         let b = layers[i][idx + stride];

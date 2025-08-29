@@ -22,6 +22,18 @@ use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 use ff::PrimeField;
 
+/// Draw an unbiased index from transcript for sampling
+pub fn draw_index<E: Engine>(t: &mut E::TE, label: &'static [u8], stride: usize) -> Result<usize, SpartanError> {
+    debug_assert!(stride > 0);
+    let c = t.squeeze(label)?;
+    let repr = c.to_repr();
+    let mut w8 = [0u8; 8];
+    w8.copy_from_slice(&repr.as_ref()[..8]);
+    let x = u64::from_le_bytes(w8);
+    // Unbiased mapping via 64x64->128 multiply-high
+    Ok(((x as u128 * stride as u128) >> 64) as usize)
+}
+
 // Import backend interface
 use super::hash_mle_backend::{MleBackend, BackendFfKeccak, Digest32};
 
@@ -137,7 +149,7 @@ pub struct HashMleEvaluationArgument<E: Engine> {
   pub rounds: Vec<Round<E>>,
   
   /// Sample openings to link consecutive layers (prevents forged layer attacks)
-  /// samples[i] contains K_SAMPLES_PER_ROUND random checks linking layer i to layer i+1
+  /// samples\[i\] contains K_SAMPLES_PER_ROUND random checks linking layer i to layer i+1
   pub samples: Vec<Vec<SampleOpening<E>>>, // len = m, each inner vec has K_SAMPLES_PER_ROUND elements
 }
 
@@ -530,9 +542,8 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePCS<E> {
       let mut round_samples = Vec::with_capacity(K_SAMPLES_PER_ROUND);
       
       for _j in 0..K_SAMPLES_PER_ROUND {
-        // Derive random index from transcript
-        let s = transcript.squeeze(b"mle/fold_sample")?;
-        let idx = (s.to_repr().as_ref()[0] as usize) % stride;
+        // Derive random index from transcript (unbiased)
+        let idx = draw_index::<E>(transcript, b"mle/fold_sample", stride)?;
         
         let a = all_layers[i][idx];
         let b = all_layers[i][idx + stride];
@@ -635,9 +646,8 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePCS<E> {
       let expected_next_depth = m - i - 1;
       
       for _j in 0..K_SAMPLES_PER_ROUND {
-        // Re-derive the same random index from transcript
-        let s = transcript.squeeze(b"mle/fold_sample")?;
-        let expected_idx = (s.to_repr().as_ref()[0] as usize) % stride;
+        // Re-derive the same random index from transcript (unbiased)
+        let expected_idx = draw_index::<E>(transcript, b"mle/fold_sample", stride)?;
         
         let sample = &arg.samples[i][_j];
         

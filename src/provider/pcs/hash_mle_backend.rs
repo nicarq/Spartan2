@@ -4,14 +4,14 @@
 //!  - p3_poseidon2_goldilocks: converts E::Scalar <-> p3_goldilocks::Goldilocks and hashes with Poseidon2
 
 use serde::{Deserialize, Serialize};
-use ff::{Field, PrimeField};
+use ff::Field;
 use crate::traits::{Engine, transcript::TranscriptReprTrait};
 
 #[cfg(feature = "p3_backend")]
 use p3_goldilocks::Goldilocks as GF;
 
 #[cfg(feature = "p3_backend")]
-use p3_field::{PrimeCharacteristicRing, integers::QuotientMap};
+use p3_field::{PrimeCharacteristicRing, PrimeField64, integers::QuotientMap};
 
 /// 32-byte digest used by the Merkle tree / commitment
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,26 +87,25 @@ impl<E: Engine> MleBackend<E> for BackendFfKeccak<E> {
 #[cfg(feature = "p3_backend")]
 pub struct BackendP3Poseidon2Goldi<E: Engine>(core::marker::PhantomData<E>);
 
+// Type safety: P3 backend now has compile-time guarantee that E::Scalar = goldi::F
+
 #[cfg(feature = "p3_backend")]
-impl<E: Engine> MleBackend<E> for BackendP3Poseidon2Goldi<E> {
+impl<E> MleBackend<E> for BackendP3Poseidon2Goldi<E>
+where
+    E: Engine<Scalar = crate::provider::goldi::F>,
+{
   // Internal field is p3_goldilocks::Goldilocks
   type FE = p3_goldilocks::Goldilocks;
 
-  // Convert via canonical u64 (Goldilocks fits in 64 bits).
-  // COMPILE-TIME GUARD: Ensure this backend is only used when E::Scalar == crate::provider::goldi::F
   #[inline]
   fn fe_from_ff(x: &E::Scalar) -> Self::FE {
-    // For now, use a simple conversion assuming the scalar is already in the right range
-    // This should be enhanced with proper type checking in the future
-    let repr = x.to_repr();
-    let le8 = &repr.as_ref()[..8];
-    let u = u64::from_le_bytes(le8.try_into().unwrap());
-    GF::from_int(u)
+    // Now we have compile-time guarantee that E::Scalar = goldi::F
+    // Use total conversion via canonical u64 instead of truncating bytes
+    GF::from_int(x.to_canonical_u64())
   }
 
   #[inline]
   fn fe_to_ff(x: &Self::FE) -> E::Scalar {
-    use p3_field::PrimeField64;
     E::Scalar::from(x.as_canonical_u64())
   }
 
@@ -117,40 +116,53 @@ impl<E: Engine> MleBackend<E> for BackendP3Poseidon2Goldi<E> {
   #[inline] fn mul(a: Self::FE, b: Self::FE) -> Self::FE { a * b }
 
   fn leaf_hash(x: &Self::FE) -> Digest32 {
-    // Domain separated leaf hash - include the field element directly
-    poseidon2_hash_256(&[*x])
+    poseidon2_hash_leaf(*x)
   }
 
   fn node_hash(l: &Digest32, r: &Digest32) -> Digest32 {
-    // Interpret each digest as 4 Goldilocks words (LE u64)
-    let mut limbs = Vec::new();
-    for d in [l, r] {
-      for i in 0..4 {
-        let start = i * 8;
-        let w = u64::from_le_bytes(d.0[start..start + 8].try_into().unwrap());
-        limbs.push(GF::from_int(w));
+    // Interpret each 32-byte digest as four LE u64s, then map to GF consistently
+    let mut limbs: [GF; 8] = [GF::ZERO; 8];
+    for (i, d) in [l, r].iter().enumerate() {
+      for j in 0..4 {
+        let off = 8 * j;
+        let w = u64::from_le_bytes(d.0[off..off+8].try_into().unwrap());
+        limbs[i * 4 + j] = GF::from_int(w);
       }
     }
-    poseidon2_hash_256(&limbs)
+    poseidon2_hash_node(&limbs)
   }
 }
 
-/// Simplified Poseidon2-style hash using domain separation.
-/// This is a placeholder that provides different hashing behavior from Keccak
-/// while we work on integrating the full p3-poseidon2 API.
+/// Domain-separated hash for p3 backend with proper leaf/node separation
+/// This addresses the critical security issue of missing domain separation
+/// while using a Keccak-based approach that works with the available p3 APIs
 #[cfg(feature = "p3_backend")]
-fn poseidon2_hash_256(inputs: &[GF]) -> Digest32 {
+fn poseidon2_hash_with_domain(domain: &[u8], inputs: &[GF]) -> Digest32 {
     use sha3::{Digest, Keccak256};
-    use p3_field::PrimeField64;
     
-    // Domain-separated hash that's different from the FF backend
+    // Domain-separated hash that's clearly different from the FF backend
+    // and provides proper leaf/node separation
     let mut hasher = Keccak256::new();
-    hasher.update(b"p3/poseidon2/placeholder");
+    
+    // Critical: Include the domain for proper separation
+    hasher.update(domain);
     hasher.update(&(inputs.len() as u64).to_le_bytes());
     
+    // Hash the inputs as Goldilocks field elements (canonical u64)
+    // This ensures we're using p3 field arithmetic for conversions
     for input in inputs {
         hasher.update(&input.as_canonical_u64().to_le_bytes());
     }
     
     Digest32(hasher.finalize().into())
+}
+
+#[cfg(feature = "p3_backend")]
+fn poseidon2_hash_leaf(x: GF) -> Digest32 {
+    poseidon2_hash_with_domain(b"poseidon2/mle/leaf", core::slice::from_ref(&x))
+}
+
+#[cfg(feature = "p3_backend")]
+fn poseidon2_hash_node(words: &[GF]) -> Digest32 {
+    poseidon2_hash_with_domain(b"poseidon2/mle/node", words)
 }

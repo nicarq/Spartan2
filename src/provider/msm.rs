@@ -132,12 +132,7 @@ pub fn msm<C: CurveAffine>(
     });
   }
 
-  let num_threads = if coeffs.len() > 1024 {
-    // If the number of coefficients is large, we use parallelism.
-    // Otherwise, we use a single thread.
-    // This is a heuristic to avoid overhead from parallelism for small inputs.
-    1
-  } else if use_parallelism_internally {
+  let num_threads = if use_parallelism_internally {
     current_num_threads()
   } else {
     1

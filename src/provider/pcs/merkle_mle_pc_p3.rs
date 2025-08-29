@@ -9,6 +9,7 @@ use crate::{
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use ff::PrimeField;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Hash-MLE PCS implementation using p3/Goldilocks + Poseidon2 backend
@@ -16,7 +17,10 @@ pub struct HashMlePcsP3<E: Engine> {
   _p: core::marker::PhantomData<E>,
 }
 
-impl<E: Engine> PCSEngineTrait<E> for HashMlePcsP3<E> {
+impl<E> PCSEngineTrait<E> for HashMlePcsP3<E>
+where
+    E: Engine<Scalar = crate::provider::goldi::F>,
+{
   type CommitmentKey = HashMleCommitmentKey<E>;
   type VerifierKey   = HashMleVerifierKey<E>;
   type Commitment    = HashMleCommitment<E>;
@@ -133,6 +137,43 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePcsP3<E> {
     let layer_roots: Vec<_> = trees.iter().map(|t| MerkleRoot(t.root().0)).collect();
     transcript.absorb(TAG_LAYER_ROOTS, &layer_roots.as_slice());
 
+    // Generate sample openings to link consecutive layers (prevents forged layer attacks)
+    use super::merkle_mle_pc::{SampleOpening, K_SAMPLES_PER_ROUND};
+    let mut samples: Vec<Vec<SampleOpening<E>>> = Vec::with_capacity(m);
+    for i in 0..m {
+      let layer_size = layers[i].len();
+      let stride = layer_size / 2;
+      let mut round_samples = Vec::with_capacity(K_SAMPLES_PER_ROUND);
+      
+      for _j in 0..K_SAMPLES_PER_ROUND {
+        // Derive random index from transcript
+        let s = transcript.squeeze(b"mle/fold_sample")?;
+        let idx = (s.to_repr().as_ref()[0] as usize) % stride;
+        
+        let a = layers[i][idx];
+        let b = layers[i][idx + stride];
+        let next = P3B::<E>::add(a, P3B::<E>::mul(point[i], P3B::<E>::sub(b, a)));
+        
+        // Verify this matches the actual next layer value
+        debug_assert_eq!(next, layers[i + 1][idx]);
+        
+        let path_a = trees[i].open(idx);
+        let path_b = trees[i].open(idx + stride);
+        let path_next = trees[i + 1].open(idx);
+        
+        round_samples.push(SampleOpening {
+          idx: idx as u64,
+          a: P3B::<E>::fe_to_ff(&a),
+          b: P3B::<E>::fe_to_ff(&b),
+          next: P3B::<E>::fe_to_ff(&next),
+          path_a,
+          path_b,
+          path_next,
+        });
+      }
+      samples.push(round_samples);
+    }
+
     // Open the canonical pair per round (indices 0 and n), and the next @ 0
     let mut rounds = Vec::with_capacity(m);
     for i in 0..m {
@@ -159,7 +200,7 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePcsP3<E> {
     // Final eval is the single word at the top
     let eval = P3B::<E>::fe_to_ff(&layers.last().unwrap()[0]);
 
-    let arg = HashMleEvaluationArgument { layer_roots, rounds };
+    let arg = HashMleEvaluationArgument { layer_roots, rounds, samples };
     Ok((eval, arg))
   }
 

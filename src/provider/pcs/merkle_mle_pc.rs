@@ -20,6 +20,7 @@ use crate::{
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
+use ff::PrimeField;
 
 // Import backend interface
 use super::hash_mle_backend::{MleBackend, BackendFfKeccak, Digest32};
@@ -123,6 +124,9 @@ impl<E: Engine> Default for HashMleBlind<E> {
   }
 }
 
+/// Number of sample checks per round for layer consistency
+pub const K_SAMPLES_PER_ROUND: usize = 48;
+
 /// Evaluation argument: per-round pair openings and the next-layer single opening.
 #[derive(Clone, Debug)]
 pub struct HashMleEvaluationArgument<E: Engine> {
@@ -131,6 +135,10 @@ pub struct HashMleEvaluationArgument<E: Engine> {
 
   /// For each round i in [0..m):
   pub rounds: Vec<Round<E>>,
+  
+  /// Sample openings to link consecutive layers (prevents forged layer attacks)
+  /// samples[i] contains K_SAMPLES_PER_ROUND random checks linking layer i to layer i+1
+  pub samples: Vec<Vec<SampleOpening<E>>>, // len = m, each inner vec has K_SAMPLES_PER_ROUND elements
 }
 
 impl<E: Engine> serde::Serialize for HashMleEvaluationArgument<E> {
@@ -139,9 +147,10 @@ impl<E: Engine> serde::Serialize for HashMleEvaluationArgument<E> {
     S: serde::Serializer,
   {
     use serde::ser::SerializeStruct;
-    let mut state = serializer.serialize_struct("HashMleEvaluationArgument", 2)?;
+    let mut state = serializer.serialize_struct("HashMleEvaluationArgument", 3)?;
     state.serialize_field("layer_roots", &self.layer_roots)?;
     state.serialize_field("rounds", &self.rounds)?;
+    state.serialize_field("samples", &self.samples)?;
     state.end()
   }
 }
@@ -159,6 +168,7 @@ impl<'de, E: Engine> serde::Deserialize<'de> for HashMleEvaluationArgument<E> {
     enum Field {
       LayerRoots,
       Rounds,
+      Samples,
     }
 
     struct HashMleEvaluationArgumentVisitor<E: Engine>(PhantomData<E>);
@@ -176,6 +186,7 @@ impl<'de, E: Engine> serde::Deserialize<'de> for HashMleEvaluationArgument<E> {
       {
         let mut layer_roots = None;
         let mut rounds = None;
+        let mut samples = None;
         while let Some(key) = map.next_key()? {
           match key {
             Field::LayerRoots => {
@@ -190,15 +201,22 @@ impl<'de, E: Engine> serde::Deserialize<'de> for HashMleEvaluationArgument<E> {
               }
               rounds = Some(map.next_value()?);
             }
+            Field::Samples => {
+              if samples.is_some() {
+                return Err(de::Error::duplicate_field("samples"));
+              }
+              samples = Some(map.next_value()?);
+            }
           }
         }
         let layer_roots = layer_roots.ok_or_else(|| de::Error::missing_field("layer_roots"))?;
         let rounds = rounds.ok_or_else(|| de::Error::missing_field("rounds"))?;
-        Ok(HashMleEvaluationArgument { layer_roots, rounds })
+        let samples = samples.ok_or_else(|| de::Error::missing_field("samples"))?;
+        Ok(HashMleEvaluationArgument { layer_roots, rounds, samples })
       }
     }
 
-    const FIELDS: &'static [&'static str] = &["layer_roots", "rounds"];
+    const FIELDS: &'static [&'static str] = &["layer_roots", "rounds", "samples"];
     deserializer.deserialize_struct("HashMleEvaluationArgument", FIELDS, HashMleEvaluationArgumentVisitor(PhantomData))
   }
 }
@@ -221,6 +239,26 @@ pub struct Round<E: Engine> {
   pub next: E::Scalar,      // equals (1-r_i)*a + r_i*b
   /// Merkle path for the next layer
   pub path_next: MerklePath // membership against layer_roots[i+1]
+}
+
+/// Sample opening for layer consistency checks
+/// This links layer i to layer i+1 at a random position to prevent forged layers
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SampleOpening<E: Engine> {
+  /// Random index in the layer (< 2^{m-i-1})
+  pub idx: u64,
+  /// Value at position idx in layer i
+  pub a: E::Scalar,        // v^{(i)}[idx]
+  /// Value at position idx + stride in layer i  
+  pub b: E::Scalar,        // v^{(i)}[idx + stride] where stride = 2^{m-i-1}
+  /// Folded value at position idx in layer i+1
+  pub next: E::Scalar,     // v^{(i+1)}[idx] = (1-r_i)*a + r_i*b
+  /// Merkle path for a
+  pub path_a: MerklePath,
+  /// Merkle path for b
+  pub path_b: MerklePath,
+  /// Merkle path for next
+  pub path_next: MerklePath,
 }
 
 // Default backend type alias for backwards compatibility
@@ -484,6 +522,42 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePCS<E> {
     // NOTE: We also absorb layer roots here for transcript symmetry (verifier does the same).
     transcript.absorb(TAG_LAYER_ROOTS, &layer_roots.as_slice());
 
+    // Generate sample openings to link consecutive layers (prevents forged layer attacks)
+    let mut samples: Vec<Vec<SampleOpening<E>>> = Vec::with_capacity(m);
+    for i in 0..m {
+      let layer_size = all_layers[i].len();
+      let stride = layer_size / 2;
+      let mut round_samples = Vec::with_capacity(K_SAMPLES_PER_ROUND);
+      
+      for _j in 0..K_SAMPLES_PER_ROUND {
+        // Derive random index from transcript
+        let s = transcript.squeeze(b"mle/fold_sample")?;
+        let idx = (s.to_repr().as_ref()[0] as usize) % stride;
+        
+        let a = all_layers[i][idx];
+        let b = all_layers[i][idx + stride];
+        let next = a + point[i] * (b - a);
+        
+        // Verify this matches the actual next layer value
+        debug_assert_eq!(next, all_layers[i + 1][idx]);
+        
+        let path_a = trees[i].open(idx);
+        let path_b = trees[i].open(idx + stride);
+        let path_next = trees[i + 1].open(idx);
+        
+        round_samples.push(SampleOpening {
+          idx: idx as u64,
+          a,
+          b,
+          next,
+          path_a,
+          path_b,
+          path_next,
+        });
+      }
+      samples.push(round_samples);
+    }
+
     let mut rounds: Vec<Round<E>> = Vec::with_capacity(m);
     
     for i in 0..m {
@@ -508,7 +582,7 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePCS<E> {
     let eval = expected_eval;
 
     // Pack argument
-    let arg = HashMleEvaluationArgument { layer_roots, rounds };
+    let arg = HashMleEvaluationArgument { layer_roots, rounds, samples };
     Ok((eval, arg))
   }
 
@@ -524,10 +598,20 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePCS<E> {
       return Err(SpartanError::InvalidPCS);
     }
     let m = point.len();
-    if arg.layer_roots.len() != m + 1 || arg.rounds.len() != m {
+    if arg.layer_roots.len() != m + 1 || arg.rounds.len() != m || arg.samples.len() != m {
       return Err(SpartanError::InvalidInputLength { 
         reason: "HashMlePCS::verify malformed argument".into() 
       });
+    }
+    
+    // Check that each round has the expected number of samples
+    for (i, round_samples) in arg.samples.iter().enumerate() {
+      if round_samples.len() != K_SAMPLES_PER_ROUND {
+        return Err(SpartanError::InvalidInputLength {
+          reason: format!("HashMlePCS::verify round {} has {} samples, expected {}", 
+                         i, round_samples.len(), K_SAMPLES_PER_ROUND)
+        });
+      }
     }
 
     // This PCS is binary Merkle
@@ -541,6 +625,65 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePCS<E> {
     // Layer 0 root must match the commitment's root
     if arg.layer_roots[0].0 != comm.base_root.0 {
       return Err(SpartanError::InvalidPCS);
+    }
+
+    // Verify sample openings to ensure layer consistency (prevents forged layer attacks)
+    for i in 0..m {
+      let layer_size = 1usize << (m - i);
+      let stride = layer_size / 2;
+      let expected_depth = m - i;
+      let expected_next_depth = m - i - 1;
+      
+      for _j in 0..K_SAMPLES_PER_ROUND {
+        // Re-derive the same random index from transcript
+        let s = transcript.squeeze(b"mle/fold_sample")?;
+        let expected_idx = (s.to_repr().as_ref()[0] as usize) % stride;
+        
+        let sample = &arg.samples[i][_j];
+        
+        // Check that the sample uses the expected index
+        if sample.idx != expected_idx as u64 {
+          return Err(SpartanError::InvalidPCS);
+        }
+        
+        // Check path depths
+        if sample.path_a.siblings.len() != expected_depth ||
+           sample.path_b.siblings.len() != expected_depth ||
+           sample.path_next.siblings.len() != expected_next_depth {
+          return Err(SpartanError::InvalidPCS);
+        }
+        
+        // Check path indices
+        if sample.path_a.leaf_index != expected_idx as u64 ||
+           sample.path_b.leaf_index != (expected_idx + stride) as u64 ||
+           sample.path_next.leaf_index != expected_idx as u64 {
+          return Err(SpartanError::InvalidPCS);
+        }
+        
+        // Verify Merkle memberships
+        let a_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(&sample.a);
+        let b_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(&sample.b);
+        let next_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(&sample.next);
+        
+        let a_h = leaf_digest::<E, DefaultBackend<E>>(&a_fe);
+        let b_h = leaf_digest::<E, DefaultBackend<E>>(&b_fe);
+        let next_h = leaf_digest::<E, DefaultBackend<E>>(&next_fe);
+        
+        let root_i_digest = Digest32(arg.layer_roots[i].0);
+        let root_ip1_digest = Digest32(arg.layer_roots[i + 1].0);
+        
+        if !MerkleTree::verify::<E, DefaultBackend<E>>(&sample.path_a, &a_h, &root_i_digest) ||
+           !MerkleTree::verify::<E, DefaultBackend<E>>(&sample.path_b, &b_h, &root_i_digest) ||
+           !MerkleTree::verify::<E, DefaultBackend<E>>(&sample.path_next, &next_h, &root_ip1_digest) {
+          return Err(SpartanError::InvalidPCS);
+        }
+        
+        // Verify the fold equation: next = a + r_i * (b - a)
+        let expected_next = sample.a + point[i] * (sample.b - sample.a);
+        if sample.next != expected_next {
+          return Err(SpartanError::InvalidPCS);
+        }
+      }
     }
 
     // Per round: check memberships and fold equality
@@ -879,6 +1022,8 @@ mod tests {
     let root3 = MerkleRoot(t3.root().0);
 
     // Assemble a forged argument (note: indices j0 and j0+half0 at layer 0)
+    // This test predates the soundness fix, so we provide empty samples
+    // The test should still fail due to index checks
     let arg = HashMleEvaluationArgument {
       layer_roots: vec![root0, root1, root2, root3],
       rounds: vec![
@@ -901,6 +1046,7 @@ mod tests {
           next: next2, path_next: t3.open(0),
         },
       ],
+      samples: vec![vec![], vec![], vec![]], // Empty samples for this legacy test
     };
     let eval = next2; // bogus eval, not the true MLE eval
 

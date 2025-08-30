@@ -16,7 +16,9 @@
 
 // private modules
 mod math;
-mod r1cs;
+
+// R1CS types - public for external circuit construction
+pub mod r1cs;
 
 #[macro_use]
 mod macros;

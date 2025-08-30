@@ -203,10 +203,10 @@ mod tests {
   fn test_keccak_transcript_incremental_vs_explicit_with<E: Engine>() {
     let test_label = b"test";
     let mut transcript: Keccak256Transcript<E> = Keccak256Transcript::new(test_label);
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     // ten scalars
-    let scalars = std::iter::from_fn(|| Some(<E as Engine>::Scalar::from(rng.r#gen::<u64>())))
+    let scalars = std::iter::from_fn(|| Some(<E as Engine>::Scalar::from(rng.random::<u64>())))
       .take(10)
       .collect::<Vec<_>>();
 

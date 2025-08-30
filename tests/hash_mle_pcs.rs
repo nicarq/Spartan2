@@ -9,7 +9,7 @@ use rand::rngs::StdRng;
 use proptest::prelude::*;
 
 fn rs(rng: &mut StdRng) -> <E as Engine>::Scalar { 
-  <E as Engine>::Scalar::from(rng.r#gen::<u64>()) 
+  <E as Engine>::Scalar::from(rng.random::<u64>()) 
 }
 
 #[test]

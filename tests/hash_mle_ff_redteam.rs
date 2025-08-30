@@ -22,13 +22,13 @@ type PCS = HashMlePCS<E>;
 fn rand_poly(m: usize, seed: u64) -> Vec<F> {
     let n = 1usize << m;
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    (0..n).map(|_| F::from(rng.r#gen::<u64>())).collect()
+    (0..n).map(|_| F::from(rng.random::<u64>())).collect()
 }
 
 fn rand_point(m: usize, seed: u64) -> Vec<F> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0x55AA_77CC);
     // general field points (not just bits)
-    (0..m).map(|_| F::from(rng.r#gen::<u64>())).collect()
+    (0..m).map(|_| F::from(rng.random::<u64>())).collect()
 }
 
 fn prove_once(m: usize, seed: u64) -> (

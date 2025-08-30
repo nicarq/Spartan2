@@ -778,7 +778,7 @@ mod tests {
 
   fn rand_scalar(rng: &mut StdRng) -> <E as Engine>::Scalar {
     // sample in a tiny range (fast) then lift into field
-    let x: u64 = rng.r#gen();
+    let x: u64 = rng.random();
     <E as Engine>::Scalar::from(x)
   }
 

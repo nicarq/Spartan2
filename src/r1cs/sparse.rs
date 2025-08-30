@@ -178,6 +178,7 @@ mod tests {
     traits::{Engine, Group},
   };
   use ff::PrimeField;
+  #[cfg(not(feature = "p3_backend"))]
   use proptest::{
     prelude::*,
     strategy::{BoxedStrategy, Just, Strategy},
@@ -194,13 +195,14 @@ mod tests {
 
   #[cfg(not(target_arch = "wasm32"))]
   /// Trait implementation for generating `FWrap<F>` instances with proptest
+  #[cfg(not(feature = "p3_backend"))]
   impl<F: PrimeField> Arbitrary for FWrap<F> {
     type Parameters = ();
     type Strategy = BoxedStrategy<Self>;
 
     fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
       use rand::rngs::StdRng;
-      use rand_core::SeedableRng;
+      use rand::SeedableRng;
 
       let strategy = any::<[u8; 32]>()
         .prop_map(|seed| FWrap(F::random(StdRng::from_seed(seed))))
@@ -245,11 +247,13 @@ mod tests {
     );
   }
 
+  #[cfg(not(feature = "p3_backend"))]
   fn coo_strategy() -> BoxedStrategy<Vec<(usize, usize, FWrap<Fr>)>> {
     let coo_strategy = any::<FWrap<Fr>>().prop_flat_map(|f| (0usize..100, 0usize..100, Just(f)));
     proptest::collection::vec(coo_strategy, 10).boxed()
   }
 
+  #[cfg(not(feature = "p3_backend"))]
   proptest! {
       #[test]
       fn test_matrix_iter(mut coo_matrix in coo_strategy()) {

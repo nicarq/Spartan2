@@ -84,11 +84,11 @@ impl<Scalar: PrimeField> PowPolynomial<Scalar> {
   }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "p3_backend")))]
 mod tests {
   use super::*;
   use crate::provider::pasta::pallas;
-  use rand::rngs::OsRng;
+  use rand_core::OsRng;
 
   fn test_evals_with<Scalar: PrimeField>() {
     let t = Scalar::random(&mut OsRng);

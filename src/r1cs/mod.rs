@@ -1,5 +1,4 @@
 //! This module defines R1CS related types
-#![allow(missing_docs)]
 use crate::{
   Blind, Commitment, CommitmentKey, PCS, PartialCommitment, VerifierKey,
   digest::SimpleDigestible,

@@ -230,3 +230,33 @@ proptest! {
         }
     }
 }
+
+#[test]
+#[cfg(feature = "p3_backend")]
+fn p3_tamper_samples_fail() {
+    use spartan2::{
+        provider::{
+            keccak::Keccak256Transcript,
+            pcs::merkle_mle_pc_p3::HashMlePcsP3,
+            GoldilocksP3MerkleMleEngine as E,
+        },
+        traits::{Engine, pcs::PCSEngineTrait, transcript::TranscriptEngineTrait},
+    };
+    type F = <E as Engine>::Scalar;
+    let m = 5usize;
+    let n = 1usize << m;
+    let poly: Vec<F>  = (0..n).map(|i| F::from(i as u64)).collect();
+    let point: Vec<F> = (0..m).map(|_| F::from(1u64)).collect(); // All 1s to ensure tampering is detected
+
+    let (ck, vk) = HashMlePcsP3::<E>::setup(b"p3-sample-tamper", n);
+    let blind = HashMlePcsP3::<E>::blind(&ck, n);
+    let comm  = HashMlePcsP3::<E>::commit(&ck, &poly, &blind, false).unwrap();
+
+    let mut tp = Keccak256Transcript::<E>::new(b"p3-sample-tamper");
+    let (eval, mut arg) = HashMlePcsP3::<E>::prove(&ck, &mut tp, &comm, &poly, &blind, &point).unwrap();
+
+    // tamper one sample's next value
+    arg.samples[0][0].next = arg.samples[0][0].a;
+    let mut tv = Keccak256Transcript::<E>::new(b"p3-sample-tamper");
+    assert!(HashMlePcsP3::<E>::verify(&vk, &mut tv, &comm, &point, &eval, &arg).is_err());
+}

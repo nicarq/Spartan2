@@ -214,7 +214,7 @@ where
       return Err(SpartanError::InvalidPCS);
     }
     let m = point.len();
-    if arg.layer_roots.len() != m + 1 || arg.rounds.len() != m {
+    if arg.layer_roots.len() != m + 1 || arg.rounds.len() != m || arg.samples.len() != m {
       return Err(SpartanError::InvalidInputLength { 
         reason: "HashMlePCS_P3::verify malformed argument".into() 
       });
@@ -283,6 +283,60 @@ where
       let root_ip1_digest = super::hash_mle_backend::Digest32(*root_ip1);
       if !super::merkle_mle_pc::MerkleTree::verify::<E, P3B<E>>(&arg.rounds[i].path_next, &next_h, &root_ip1_digest) {
         return Err(SpartanError::InvalidPCS);
+      }
+    }
+
+    // --- CRITICAL: verify random sample openings to link layers i -> i+1 ---
+    use super::merkle_mle_pc::{draw_index, K_SAMPLES_PER_ROUND};
+    for i in 0..m {
+      let layer_size = 1usize << (m - i);
+      let stride = layer_size / 2;
+      let expected_depth = m - i;
+      let expected_next_depth = m - i - 1;
+
+      if arg.samples[i].len() != K_SAMPLES_PER_ROUND {
+        return Err(SpartanError::InvalidPCS);
+      }
+
+      for _j in 0..K_SAMPLES_PER_ROUND {
+        // re-derive index from transcript
+        let expected_idx = draw_index::<E>(transcript, b"mle/fold_sample", stride)?;
+        let s = &arg.samples[i][_j];
+
+        // index / depth sanity
+        if s.idx != expected_idx as u64
+          || s.path_a.leaf_index != expected_idx as u64
+          || s.path_b.leaf_index != (expected_idx + stride) as u64
+          || s.path_next.leaf_index != expected_idx as u64
+          || s.path_a.siblings.len() != expected_depth
+          || s.path_b.siblings.len() != expected_depth
+          || s.path_next.siblings.len() != expected_next_depth
+        {
+          return Err(SpartanError::InvalidPCS);
+        }
+
+        // Poseidon2 hashing in p3 field
+        let a_fe   = <P3B<E> as MleBackend<E>>::fe_from_ff(&s.a);
+        let b_fe   = <P3B<E> as MleBackend<E>>::fe_from_ff(&s.b);
+        let next_fe= <P3B<E> as MleBackend<E>>::fe_from_ff(&s.next);
+        let a_h    = super::merkle_mle_pc::leaf_digest::<E, P3B<E>>(&a_fe);
+        let b_h    = super::merkle_mle_pc::leaf_digest::<E, P3B<E>>(&b_fe);
+        let next_h = super::merkle_mle_pc::leaf_digest::<E, P3B<E>>(&next_fe);
+        let root_i     = super::hash_mle_backend::Digest32(arg.layer_roots[i].0);
+        let root_ip1   = super::hash_mle_backend::Digest32(arg.layer_roots[i+1].0);
+
+        if !super::merkle_mle_pc::MerkleTree::verify::<E, P3B<E>>(&s.path_a, &a_h, &root_i)
+          || !super::merkle_mle_pc::MerkleTree::verify::<E, P3B<E>>(&s.path_b, &b_h, &root_i)
+          || !super::merkle_mle_pc::MerkleTree::verify::<E, P3B<E>>(&s.path_next, &next_h, &root_ip1)
+        {
+          return Err(SpartanError::InvalidPCS);
+        }
+
+        // fold equation (in ff / E::Scalar)
+        let expected_next = s.a + point[i] * (s.b - s.a);
+        if s.next != expected_next {
+          return Err(SpartanError::InvalidPCS);
+        }
       }
     }
 

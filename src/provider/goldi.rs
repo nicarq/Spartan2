@@ -38,9 +38,13 @@ impl Field for F {
     const ONE: Self = Self(1);
 
     fn random(mut rng: impl rand_core::RngCore) -> Self {
-        // Generate a random u64 and reduce
-        let val = rng.next_u64();
-        Self::new(val)
+        // Rejection sampling (unbiased)
+        loop {
+            let x = rng.next_u64();
+            if x < GOLDILOCKS_MODULUS {
+                return Self::from_canonical_u64(x);
+            }
+        }
     }
 
     fn square(&self) -> Self {

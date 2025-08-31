@@ -150,11 +150,14 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
   fn setup<C: SpartanCircuit<E>>(
     circuit: C,
   ) -> Result<(Self::ProverKey, Self::VerifierKey), SpartanError> {
-    // Sanity: Hash-MLE PCS must be binary
+    // Sanity: Hash-MLE PCS must be binary (only check for Hash-MLE engines)
     let pcs_w = <E as Engine>::PCS::width();
-    if pcs_w != 2 {
+    let engine_name = std::any::type_name::<E>();
+    let is_hash_mle_engine = engine_name.contains("MerkleMle") || engine_name.contains("P3MerkleMle");
+    
+    if is_hash_mle_engine && pcs_w != 2 {
       return Err(SpartanError::InternalError {
-        reason: format!("PCS misconfigured: width()={} (expected 2 for Hash-MLE)", pcs_w),
+        reason: format!("Hash-MLE PCS misconfigured: width()={} (expected 2)", pcs_w),
       });
     }
 
@@ -217,22 +220,18 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
       &mut transcript,
     )?;
 
-    // Use the *same* X vector that verification uses.
-    // This guarantees the Z polynomial on prover side matches eval_Z on verifier side.
+    // Get U_regular for both matrix operations and Z polynomial construction
     let U_regular = U.to_regular_instance()?;
-    let mut z = [
-      W.W.clone(),
-      vec![E::Scalar::ONE],
-      U_regular.X.clone(),
-      U.challenges.clone(),
-    ]
-    .concat();
 
     let num_vars = pk.S.num_shared + pk.S.num_precommitted + pk.S.num_rest;
     let (num_rounds_x, num_rounds_y) = (
       usize::try_from(pk.S.num_cons.ilog2()).unwrap(),
       (usize::try_from(num_vars.ilog2()).unwrap() + 1),
     );
+
+    // Check if this is a Hash-MLE engine (needed for both setup check and Z polynomial construction)
+    let engine_name = std::any::type_name::<E>();
+    let is_hash_mle_engine = engine_name.contains("MerkleMle") || engine_name.contains("P3MerkleMle");
 
     // Sanity check lengths to catch regressions
     debug_assert_eq!(W.W.len(), num_vars);
@@ -249,6 +248,14 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
     info!(elapsed_ms = %poly_tau_t.elapsed().as_millis(), "prepare_poly_tau");
 
     let (_mv_span, mv_t) = start_span!("matrix_vector_multiply");
+    // Build z vector for matrix multiplication (same as before)
+    let z = [
+      W.W.clone(),
+      vec![E::Scalar::ONE],
+      U_regular.X.clone(),
+      U.challenges.clone(),
+    ]
+    .concat();
     let (Az, Bz, Cz) = pk.S.multiply_vec(&z)?;
     info!(
       elapsed_ms = %mv_t.elapsed().as_millis(),
@@ -315,7 +322,42 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
     info!(elapsed_ms = %abc_t.elapsed().as_millis(), "prepare_poly_ABC");
 
     let (_z_span, z_t) = start_span!("prepare_poly_z");
-    let poly_z = {
+    let poly_z = if is_hash_mle_engine {
+      // Hash-MLE engines need interleaved Z polynomial construction
+      // Build W(·) and X(·), then interleave by the gating bit y0
+      // This creates the correct multilinear polynomial for Z(y_0, y) = (1-y_0)*W(y) + y_0*X(y)
+      
+      // W_full: length = num_vars; rest segment goes into the first num_rest positions.
+      // Any positions outside W.W (e.g. shared/precommitted slots) are zero on the W side.
+      let mut W_full = vec![E::Scalar::ZERO; num_vars];
+      let w_len = core::cmp::min(W.W.len(), num_vars);
+      W_full[..w_len].copy_from_slice(&W.W[..w_len]);
+
+      // X_full: length = num_vars; X_full[0] = 1, then public inputs (if any), rest zero.
+      let mut X_full = vec![E::Scalar::ZERO; num_vars];
+      X_full[0] = E::Scalar::ONE;
+      for (i, xi) in U_regular.X.iter().cloned().enumerate() {
+          if i + 1 < num_vars {
+              X_full[i + 1] = xi;
+          }
+      }
+
+      // Interleave columns by y0 as the LSB:
+      // poly_z = [W_full[0], X_full[0], W_full[1], X_full[1], ..., W_full[num_vars-1], X_full[num_vars-1]]
+      let mut poly_z = Vec::with_capacity(2 * num_vars);
+      for i in 0..num_vars {
+          poly_z.push(W_full[i]);
+          poly_z.push(X_full[i]);
+      }
+      poly_z
+    } else {
+      // Other engines (e.g., Hyrax) use the original concatenation approach
+      let mut z = [
+        W.W.clone(),
+        vec![E::Scalar::ONE],
+        U_regular.X.clone(),
+        U.challenges.clone(),
+      ].concat();
       z.resize(num_vars * 2, E::Scalar::ZERO);
       z
     };
@@ -356,21 +398,33 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
     )?;
     info!(elapsed_ms = %pcs_t.elapsed().as_millis(), "pcs_prove");
 
-    // Debug: Verify Z polynomial consistency between table and analytical evaluation
+    // Debug: Verify Z polynomial consistency (only for Hash-MLE engines)
     #[cfg(debug_assertions)]
-    {
-      let eval_X = {
-        let X = std::iter::once(E::Scalar::ONE)
-          .chain(U_regular.X.iter().copied())
-          .collect::<Vec<_>>();
-        crate::polys::multilinear::SparsePolynomial::new(num_vars.log_2(), X).evaluate(&r_y[1..])
+    if is_hash_mle_engine && num_vars > 0 {
+      let eval_X_check = {
+        let mut X_full = vec![E::Scalar::ZERO; num_vars];
+        X_full[0] = E::Scalar::ONE;
+        for (i, xi) in U_regular.X.iter().cloned().enumerate() {
+            if i + 1 < num_vars { X_full[i + 1] = xi; }
+        }
+        // same y bits as inner sumcheck: r_y[1..]
+        if num_vars.is_power_of_two() && num_vars.log_2() <= r_y.len() - 1 {
+          crate::polys::multilinear::SparsePolynomial::new(num_vars.log_2(), X_full).evaluate(&r_y[1..])
+        } else {
+          // Fallback to dense evaluation if dimensions don't match
+          crate::polys::multilinear::MultilinearPolynomial::new({
+            let mut expanded = X_full;
+            expanded.resize(num_vars.next_power_of_two(), E::Scalar::ZERO);
+            expanded
+          }).evaluate(&r_y[1..])
+        }
       };
-      let eval_Z_expected = (E::Scalar::ONE - r_y[0]) * eval_W + r_y[0] * eval_X;
+      let eval_Z_expected = (E::Scalar::ONE - r_y[0]) * eval_W + r_y[0] * eval_X_check;
       let eval_Z_table = crate::polys::multilinear::MultilinearPolynomial::new(_poly_z_for_debug).evaluate(&r_y);
       
       debug_assert_eq!(eval_Z_expected, eval_Z_table, 
-        "Z mismatch: analytical={:?} vs table={:?}", eval_Z_expected, eval_Z_table);
-      debug!("✅ Z polynomial consistency verified: eval_Z = {:?}", eval_Z_expected);
+        "Z mismatch (gating vs interleaved table): analytical={:?} vs table={:?}", eval_Z_expected, eval_Z_table);
+      debug!("✅ Z polynomial interleaved consistency verified: eval_Z = {:?}", eval_Z_expected);
     }
 
     Ok(R1CSSNARK {

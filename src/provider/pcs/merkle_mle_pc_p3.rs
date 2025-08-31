@@ -27,7 +27,9 @@ where
   type Blind = HashMleBlind<E>;
   type EvaluationArgument = HashMleEvaluationArgument<E>;
 
-  fn width() -> usize { usize::MAX / 2 }
+  /// Arity of the multilinear domain (binary hypercube).
+  /// For MLE commitments this MUST be 2.
+  fn width() -> usize { 2 }
 
   fn setup(_label: &'static [u8], _n: usize) -> (Self::CommitmentKey, Self::VerifierKey) {
     let ck = HashMleCommitmentKey { branching: 2, zk_mode: ZkMode::LeakReduced, _p: core::marker::PhantomData };
@@ -347,5 +349,16 @@ where
     }
 
     Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::provider::GoldilocksP3MerkleMleEngine as E;
+
+  #[test]
+  fn width_is_binary_p3() {
+    assert_eq!(<HashMlePcsP3<E> as PCSEngineTrait<E>>::width(), 2);
   }
 }

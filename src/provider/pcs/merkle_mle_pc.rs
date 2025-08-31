@@ -391,9 +391,9 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePCS<E> {
   type Blind = HashMleBlind<E>;
   type EvaluationArgument = HashMleEvaluationArgument<E>;
 
-  fn width() -> usize { 
-    usize::MAX / 2 // force a single "row" per commitment
-  }
+  /// Arity of the multilinear domain (binary hypercube).
+  /// For MLE commitments this MUST be 2.
+  fn width() -> usize { 2 }
 
   fn setup(_label: &'static [u8], _n: usize) -> (Self::CommitmentKey, Self::VerifierKey) {
     let ck = HashMleCommitmentKey { 
@@ -976,6 +976,11 @@ mod tests {
     arg.layer_roots[1].0[0] ^= 0x01;
     let mut tr_v = <E as Engine>::TE::new(b"x");
     assert!(<HashMlePCS<E> as PCSEngineTrait<E>>::verify(&vk, &mut tr_v, &com, &point, &eval, &arg).is_err());
+  }
+
+  #[test]
+  fn width_is_binary() {
+    assert_eq!(<HashMlePCS<E> as PCSEngineTrait<E>>::width(), 2);
   }
 
   #[test]

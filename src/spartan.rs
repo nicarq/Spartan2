@@ -150,6 +150,14 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
   fn setup<C: SpartanCircuit<E>>(
     circuit: C,
   ) -> Result<(Self::ProverKey, Self::VerifierKey), SpartanError> {
+    // Sanity: Hash-MLE PCS must be binary
+    let pcs_w = <E as Engine>::PCS::width();
+    if pcs_w != 2 {
+      return Err(SpartanError::InternalError {
+        reason: format!("PCS misconfigured: width()={} (expected 2 for Hash-MLE)", pcs_w),
+      });
+    }
+
     let S = ShapeCS::r1cs_shape(&circuit)?;
     let (ck, vk_ee) = SplitR1CSShape::commitment_key(&[&S])?;
 

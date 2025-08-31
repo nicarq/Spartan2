@@ -217,11 +217,13 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
       &mut transcript,
     )?;
 
-    // compute the full satisfying assignment by concatenating W.W, 1, and U.X
+    // Use the *same* X vector that verification uses.
+    // This guarantees the Z polynomial on prover side matches eval_Z on verifier side.
+    let U_regular = U.to_regular_instance()?;
     let mut z = [
       W.W.clone(),
       vec![E::Scalar::ONE],
-      U.public_values.clone(),
+      U_regular.X.clone(),
       U.challenges.clone(),
     ]
     .concat();
@@ -231,6 +233,11 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
       usize::try_from(pk.S.num_cons.ilog2()).unwrap(),
       (usize::try_from(num_vars.ilog2()).unwrap() + 1),
     );
+
+    // Sanity check lengths to catch regressions
+    debug_assert_eq!(W.W.len(), num_vars);
+    debug_assert!(U_regular.X.len() <= num_vars, 
+      "X vector too long: {} > {}", U_regular.X.len(), num_vars);
 
     // outer sum-check preparation
     let tau = (0..num_rounds_x)
@@ -326,6 +333,8 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
     let comb_func = |poly_A_comp: &E::Scalar, poly_B_comp: &E::Scalar| -> E::Scalar {
       *poly_A_comp * *poly_B_comp
     };
+    // Clone poly_z for debug assertions later
+    let _poly_z_for_debug = poly_z.clone();
     let (sc_proof_inner, r_y, _claims_inner) = SumcheckProof::prove_quad(
       &claim_inner_joint,
       num_rounds_y,
@@ -337,7 +346,6 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
     info!(elapsed_ms = %sc2_t.elapsed().as_millis(), "inner_sumcheck");
 
     let (_pcs_span, pcs_t) = start_span!("pcs_prove");
-    let U_regular = U.to_regular_instance()?;
     let (eval_W, eval_arg) = E::PCS::prove(
       &pk.ck,
       &mut transcript,
@@ -347,6 +355,23 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
       &r_y[1..],
     )?;
     info!(elapsed_ms = %pcs_t.elapsed().as_millis(), "pcs_prove");
+
+    // Debug: Verify Z polynomial consistency between table and analytical evaluation
+    #[cfg(debug_assertions)]
+    {
+      let eval_X = {
+        let X = std::iter::once(E::Scalar::ONE)
+          .chain(U_regular.X.iter().copied())
+          .collect::<Vec<_>>();
+        crate::polys::multilinear::SparsePolynomial::new(num_vars.log_2(), X).evaluate(&r_y[1..])
+      };
+      let eval_Z_expected = (E::Scalar::ONE - r_y[0]) * eval_W + r_y[0] * eval_X;
+      let eval_Z_table = crate::polys::multilinear::MultilinearPolynomial::new(_poly_z_for_debug).evaluate(&r_y);
+      
+      debug_assert_eq!(eval_Z_expected, eval_Z_table, 
+        "Z mismatch: analytical={:?} vs table={:?}", eval_Z_expected, eval_Z_table);
+      debug!("✅ Z polynomial consistency verified: eval_Z = {:?}", eval_Z_expected);
+    }
 
     Ok(R1CSSNARK {
       U,

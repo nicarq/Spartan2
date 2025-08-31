@@ -333,12 +333,18 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
       let w_len = core::cmp::min(W.W.len(), num_vars);
       W_full[..w_len].copy_from_slice(&W.W[..w_len]);
 
-      // X_full: length = num_vars; X_full[0] = 1, then public inputs (if any), rest zero.
+      // X_full: broadcast X to match W's length when X is just the constant [1]
       let mut X_full = vec![E::Scalar::ZERO; num_vars];
-      X_full[0] = E::Scalar::ONE;
-      for (i, xi) in U_regular.X.iter().cloned().enumerate() {
-          if i + 1 < num_vars {
-              X_full[i + 1] = xi;
+      if U_regular.X.len() == 1 && num_vars > 1 {
+          // Broadcast the constant X[0] (which should be 1) to all positions
+          X_full.fill(U_regular.X[0]);
+      } else {
+          // Standard case: X_full[0] = 1, then public inputs (if any), rest zero
+          X_full[0] = E::Scalar::ONE;
+          for (i, xi) in U_regular.X.iter().cloned().enumerate() {
+              if i + 1 < num_vars {
+                  X_full[i + 1] = xi;
+              }
           }
       }
 
@@ -403,21 +409,22 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
     if is_hash_mle_engine && num_vars > 0 {
       let eval_X_check = {
         let mut X_full = vec![E::Scalar::ZERO; num_vars];
-        X_full[0] = E::Scalar::ONE;
-        for (i, xi) in U_regular.X.iter().cloned().enumerate() {
-            if i + 1 < num_vars { X_full[i + 1] = xi; }
-        }
-        // same y bits as inner sumcheck: r_y[1..]
-        if num_vars.is_power_of_two() && num_vars.log_2() <= r_y.len() - 1 {
-          crate::polys::multilinear::SparsePolynomial::new(num_vars.log_2(), X_full).evaluate(&r_y[1..])
+        if U_regular.X.len() == 1 && num_vars > 1 {
+            // Use the same broadcasting logic as in the prover
+            X_full.fill(U_regular.X[0]);
         } else {
-          // Fallback to dense evaluation if dimensions don't match
-          crate::polys::multilinear::MultilinearPolynomial::new({
-            let mut expanded = X_full;
-            expanded.resize(num_vars.next_power_of_two(), E::Scalar::ZERO);
-            expanded
-          }).evaluate(&r_y[1..])
+            // Standard case
+            X_full[0] = E::Scalar::ONE;
+            for (i, xi) in U_regular.X.iter().cloned().enumerate() {
+                if i + 1 < num_vars { X_full[i + 1] = xi; }
+            }
         }
+        // Evaluate with safe polynomial evaluation (handles edge cases)
+        crate::polys::multilinear::MultilinearPolynomial::new({
+          let mut expanded = X_full;
+          expanded.resize(num_vars.next_power_of_two(), E::Scalar::ZERO);
+          expanded
+        }).evaluate(&r_y[1..])
       };
       let eval_Z_expected = (E::Scalar::ONE - r_y[0]) * eval_W + r_y[0] * eval_X_check;
       let eval_Z_table = crate::polys::multilinear::MultilinearPolynomial::new(_poly_z_for_debug).evaluate(&r_y);

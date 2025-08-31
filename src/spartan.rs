@@ -323,9 +323,9 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
 
     let (_z_span, z_t) = start_span!("prepare_poly_z");
     let poly_z = if is_hash_mle_engine {
-      // Hash-MLE engines need interleaved Z polynomial construction
-      // Build W(·) and X(·), then interleave by the gating bit y0
-      // This creates the correct multilinear polynomial for Z(y_0, y) = (1-y_0)*W(y) + y_0*X(y)
+      // Hash-MLE engines need proper Z polynomial construction
+      // Build W(·) and X(·), then concatenate by the gating bit y0 as MSB
+      // This creates Z(y_0, y) = (1-y_0)*W(y) + y_0*X(y) where y_0 is the first coordinate (MSB)
       
       // W_full: length = num_vars; rest segment goes into the first num_rest positions.
       // Any positions outside W.W (e.g. shared/precommitted slots) are zero on the W side.
@@ -348,13 +348,11 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
           }
       }
 
-      // Interleave columns by y0 as the LSB:
-      // poly_z = [W_full[0], X_full[0], W_full[1], X_full[1], ..., W_full[num_vars-1], X_full[num_vars-1]]
+      // Concatenate blocks with y0 as MSB (consistent with Spartan2's r_y[0] gating convention):
+      // poly_z = [W_full[0], W_full[1], ..., W_full[num_vars-1], X_full[0], X_full[1], ..., X_full[num_vars-1]]
       let mut poly_z = Vec::with_capacity(2 * num_vars);
-      for i in 0..num_vars {
-          poly_z.push(W_full[i]);
-          poly_z.push(X_full[i]);
-      }
+      poly_z.extend_from_slice(&W_full);
+      poly_z.extend_from_slice(&X_full);
       poly_z
     } else {
       // Other engines (e.g., Hyrax) use the original concatenation approach

@@ -140,7 +140,8 @@ impl<E: Engine> Default for HashMleBlind<E> {
 pub const K_SAMPLES_PER_ROUND: usize = 48;
 
 /// Evaluation argument: per-round pair openings and the next-layer single opening.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct HashMleEvaluationArgument<E: Engine> {
   /// Layer roots carried here to avoid bloating the commitment
   pub layer_roots: Vec<MerkleRoot>, // len = m+1
@@ -153,85 +154,6 @@ pub struct HashMleEvaluationArgument<E: Engine> {
   pub samples: Vec<Vec<SampleOpening<E>>>, // len = m, each inner vec has K_SAMPLES_PER_ROUND elements
 }
 
-impl<E: Engine> serde::Serialize for HashMleEvaluationArgument<E> {
-  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-  where
-    S: serde::Serializer,
-  {
-    use serde::ser::SerializeStruct;
-    let mut state = serializer.serialize_struct("HashMleEvaluationArgument", 3)?;
-    state.serialize_field("layer_roots", &self.layer_roots)?;
-    state.serialize_field("rounds", &self.rounds)?;
-    state.serialize_field("samples", &self.samples)?;
-    state.end()
-  }
-}
-
-impl<'de, E: Engine> serde::Deserialize<'de> for HashMleEvaluationArgument<E> {
-  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-  where
-    D: serde::Deserializer<'de>,
-  {
-    use serde::de::{self, MapAccess, Visitor};
-    use std::fmt;
-
-    #[derive(serde::Deserialize)]
-    #[serde(field_identifier, rename_all = "snake_case")]
-    enum Field {
-      LayerRoots,
-      Rounds,
-      Samples,
-    }
-
-    struct HashMleEvaluationArgumentVisitor<E: Engine>(PhantomData<E>);
-
-    impl<'de, E: Engine> Visitor<'de> for HashMleEvaluationArgumentVisitor<E> {
-      type Value = HashMleEvaluationArgument<E>;
-
-      fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("struct HashMleEvaluationArgument")
-      }
-
-      fn visit_map<V>(self, mut map: V) -> Result<HashMleEvaluationArgument<E>, V::Error>
-      where
-        V: MapAccess<'de>,
-      {
-        let mut layer_roots = None;
-        let mut rounds = None;
-        let mut samples = None;
-        while let Some(key) = map.next_key()? {
-          match key {
-            Field::LayerRoots => {
-              if layer_roots.is_some() {
-                return Err(de::Error::duplicate_field("layer_roots"));
-              }
-              layer_roots = Some(map.next_value()?);
-            }
-            Field::Rounds => {
-              if rounds.is_some() {
-                return Err(de::Error::duplicate_field("rounds"));
-              }
-              rounds = Some(map.next_value()?);
-            }
-            Field::Samples => {
-              if samples.is_some() {
-                return Err(de::Error::duplicate_field("samples"));
-              }
-              samples = Some(map.next_value()?);
-            }
-          }
-        }
-        let layer_roots = layer_roots.ok_or_else(|| de::Error::missing_field("layer_roots"))?;
-        let rounds = rounds.ok_or_else(|| de::Error::missing_field("rounds"))?;
-        let samples = samples.ok_or_else(|| de::Error::missing_field("samples"))?;
-        Ok(HashMleEvaluationArgument { layer_roots, rounds, samples })
-      }
-    }
-
-    const FIELDS: &'static [&'static str] = &["layer_roots", "rounds", "samples"];
-    deserializer.deserialize_struct("HashMleEvaluationArgument", FIELDS, HashMleEvaluationArgumentVisitor(PhantomData))
-  }
-}
 
 /// A single round of the Hash-MLE evaluation argument
 #[derive(Clone, Debug, Serialize, Deserialize)]

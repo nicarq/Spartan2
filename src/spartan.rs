@@ -500,19 +500,6 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
       println!("  Table eval_Z = {:?}", eval_Z_table);
       println!("  Expected (from W@y1.., X@y1..) = {:?}", eval_Z_expected);
       
-      // Debug the table structure itself
-      println!("🔧 TABLE STRUCTURE DEBUG:");
-      println!("  r_y = {:?}", r_y);
-      println!("  W_full = {:?}", &_poly_z_for_debug[..num_vars]);
-      println!("  X_full = {:?}", &_poly_z_for_debug[num_vars..]);
-      
-      // Check if eval_W matches W_full evaluation at y1..
-      let eval_W_direct = crate::polys::multilinear::MultilinearPolynomial::new(_poly_z_for_debug[..num_vars].to_vec()).evaluate(ry_no_gate);
-      let eval_X_direct = crate::polys::multilinear::MultilinearPolynomial::new(_poly_z_for_debug[num_vars..].to_vec()).evaluate(ry_no_gate);
-      println!("  eval_W_direct = {:?}", eval_W_direct);
-      println!("  eval_X_direct = {:?}", eval_X_direct);
-      println!("  eval_W (from PCS) = {:?}", eval_W);
-
       if eval_Z_expected == eval_Z_table {
         println!("✅ Gating with y0 is CORRECT.");
       } else {

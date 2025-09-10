@@ -189,6 +189,7 @@ mod tests {
 
   /// Wrapper struct around a field element that implements additional traits
   #[derive(Clone, Debug, PartialEq, Eq)]
+  #[allow(dead_code)] // Used conditionally in proptest implementations
   pub struct FWrap<F: PrimeField>(pub F);
 
   impl<F: PrimeField> Copy for FWrap<F> {}

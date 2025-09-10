@@ -90,13 +90,19 @@ where
   }
 
   fn prove(
-    _ck: &Self::CommitmentKey,
+    ck: &Self::CommitmentKey,
     transcript: &mut E::TE,
     comm: &Self::Commitment,
     poly_ff: &[E::Scalar],
-    _blind: &Self::Blind,
+    blind: &Self::Blind,
     point_ff: &[E::Scalar],
   ) -> Result<(E::Scalar, Self::EvaluationArgument), SpartanError> {
+    // Check if streaming mode is enabled
+    if matches!(ck.zk_mode, ZkMode::LeakReducedStreaming) {
+      return HashMlePcsP3::<E>::prove_streaming(ck, transcript, comm, poly_ff, blind, point_ff);
+    }
+    
+    // Continue with traditional LeakReduced mode
     let n = poly_ff.len();
     let m = point_ff.len();
     if n != (1usize << m) {
@@ -228,7 +234,16 @@ where
     }
 
     transcript.absorb(b"poly_com", comm);
-    transcript.absorb(TAG_LAYER_ROOTS, &arg.layer_roots.as_slice());
+    
+    // Choose transcript schedule based on mode
+    match comm.mode {
+      ZkMode::LeakReduced => {
+        transcript.absorb(TAG_LAYER_ROOTS, &arg.layer_roots.as_slice());
+      }
+      ZkMode::LeakReducedStreaming => {
+        // no global absorb; we'll absorb per-layer below
+      }
+    }
 
     // Layer 0 root must match the commitment's root
     if arg.layer_roots[0].0 != comm.base_root.0 {
@@ -289,7 +304,7 @@ where
     }
 
     // --- CRITICAL: verify random sample openings to link layers i -> i+1 ---
-    use super::merkle_mle_pc::{draw_index, K_SAMPLES_PER_ROUND};
+    use super::merkle_mle_pc::{draw_index, K_SAMPLES_PER_ROUND, TAG_ROOT_I, TAG_ROOT_IP1};
     for i in 0..m {
       let layer_size = 1usize << (m - i);
       let stride = layer_size / 2;
@@ -298,6 +313,13 @@ where
 
       if arg.samples[i].len() != K_SAMPLES_PER_ROUND {
         return Err(SpartanError::InvalidPCS);
+      }
+
+      // In streaming mode, bind the per-layer pair BEFORE drawing the K indices,
+      // exactly like the prover did.
+      if matches!(comm.mode, ZkMode::LeakReducedStreaming) {
+        transcript.absorb(TAG_ROOT_I, &arg.layer_roots[i]);
+        transcript.absorb(TAG_ROOT_IP1, &arg.layer_roots[i+1]);
       }
 
       for _j in 0..K_SAMPLES_PER_ROUND {
@@ -349,6 +371,130 @@ where
     }
 
     Ok(())
+  }
+}
+
+/// Additional methods for HashMlePcsP3
+impl<E: Engine<Scalar = crate::provider::goldi::F>> HashMlePcsP3<E> {
+  /// Streaming prove method for LeakReducedStreaming mode
+  /// Processes layers pair-wise to reduce memory footprint
+  pub fn prove_streaming(
+    _ck: &HashMleCommitmentKey<E>,
+    transcript: &mut E::TE,
+    comm: &HashMleCommitment<E>,
+    poly_ff: &[E::Scalar],
+    _blind: &HashMleBlind<E>,
+    point_ff: &[E::Scalar],
+  ) -> Result<(E::Scalar, HashMleEvaluationArgument<E>), SpartanError> {
+    let n = poly_ff.len();
+    let m = point_ff.len();
+    if n != (1usize << m) {
+      return Err(SpartanError::InvalidInputLength {
+        reason: format!("HashMlePcsP3::prove_streaming expected {} elements, got {}", 1usize << m, n)
+      });
+    }
+    
+    transcript.absorb(b"poly_com", comm);
+
+    // Convert to p3 field
+    let poly = poly_ff.iter().map(P3B::<E>::fe_from_ff).collect::<Vec<_>>();
+    let point = point_ff.iter().map(P3B::<E>::fe_from_ff).collect::<Vec<_>>();
+
+    // Use the MultilinearPolynomial's own evaluation method to get the correct result
+    use crate::polys::multilinear::MultilinearPolynomial;
+    let mle = MultilinearPolynomial::new(poly_ff.to_vec());
+    let expected_eval = mle.evaluate(point_ff);
+
+    let mut layer_roots = Vec::with_capacity(m + 1);
+    let mut rounds = Vec::with_capacity(m);
+    let mut samples = Vec::with_capacity(m);
+
+    // Start with the base layer (already in p3 field)
+    let mut current_layer = poly;
+    
+    // Process each layer pair (i, i+1) for streaming
+    for i in 0..m {
+      let r_i = point[i];
+      
+      // Build tree for current layer
+      let current_leaves = current_layer.par_iter().map(|x| {
+        super::merkle_mle_pc::leaf_digest::<E, P3B<E>>(x)
+      }).collect::<Vec<_>>();
+      let current_tree = super::merkle_mle_pc::MerkleTree::from_leaves::<E, P3B<E>>(current_leaves);
+      let current_root = MerkleRoot(current_tree.root().0);
+      
+      // Fold to next layer using p3 field arithmetic
+      let n2 = current_layer.len() / 2;
+      let mut next_layer = Vec::with_capacity(n2);
+      next_layer.par_extend((0..n2).into_par_iter().map(|j| {
+        let a = current_layer[j]; let b = current_layer[j + n2];
+        // (1-r)*a + r*b  ==  a + r*(b-a)
+        P3B::<E>::add(a, P3B::<E>::mul(r_i, P3B::<E>::sub(b, a)))
+      }));
+      
+      // Build tree for next layer
+      let next_leaves = next_layer.par_iter().map(|x| {
+        super::merkle_mle_pc::leaf_digest::<E, P3B<E>>(x)
+      }).collect::<Vec<_>>();
+      let next_tree = super::merkle_mle_pc::MerkleTree::from_leaves::<E, P3B<E>>(next_leaves);
+      let next_root = MerkleRoot(next_tree.root().0);
+      
+      // Store roots for this layer pair
+      if i == 0 { layer_roots.push(current_root.clone()); }
+      layer_roots.push(next_root.clone());
+      
+      // Absorb per-layer tags for streaming schedule
+      transcript.absorb(TAG_ROOT_I, &current_root);
+      transcript.absorb(TAG_ROOT_IP1, &next_root);
+      
+      // Generate samples for this layer pair  
+      // Use the module-level constant to maintain soundness (48 samples)
+      let mut round_samples = Vec::with_capacity(K_SAMPLES_PER_ROUND);
+      
+      for _j in 0..K_SAMPLES_PER_ROUND {
+        let stride = current_layer.len() / 2; 
+        let idx = super::merkle_mle_pc::draw_index::<E>(transcript, b"mle/fold_sample", stride)?;
+        let idx_next = idx;
+        
+        let a = current_layer[idx];
+        let b = current_layer[idx + stride];
+        let next = next_layer[idx_next];
+        
+        let sample = SampleOpening {
+          idx: idx as u64,
+          a: P3B::<E>::fe_to_ff(&a),
+          b: P3B::<E>::fe_to_ff(&b),
+          next: P3B::<E>::fe_to_ff(&next),
+          path_a: current_tree.open(idx),
+          path_b: current_tree.open(idx + stride),
+          path_next: next_tree.open(idx_next),
+        };
+        round_samples.push(sample);
+      }
+      
+      samples.push(round_samples);
+      
+      // Create round entry for backwards compatibility
+      let round = super::merkle_mle_pc::Round {
+        a: P3B::<E>::fe_to_ff(&current_layer[0]),
+        b: P3B::<E>::fe_to_ff(&current_layer[current_layer.len() / 2]),
+        path_a: current_tree.open(0),
+        path_b: current_tree.open(current_layer.len() / 2),
+        next: P3B::<E>::fe_to_ff(&next_layer[0]),
+        path_next: next_tree.open(0),
+      };
+      rounds.push(round);
+      
+      // Move to next iteration (discard current layer tree to save memory)
+      current_layer = next_layer;
+    }
+
+    // Safety check: ensure we have exactly m+1 layer roots
+    debug_assert_eq!(layer_roots.len(), m + 1, "P3 streaming prover must produce exactly m+1 layer roots");
+
+    let eval = expected_eval;
+    let arg = HashMleEvaluationArgument { layer_roots, rounds, samples };
+    Ok((eval, arg))
   }
 }
 

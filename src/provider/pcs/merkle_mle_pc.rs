@@ -45,12 +45,18 @@ const TAG_NODE: &[u8] = b"mle/node";
 const TAG_MODE: &[u8] = b"mle/mode";
 /// Tag used for layer roots in the transcript
 pub const TAG_LAYER_ROOTS: &[u8] = b"mle/layer_roots";
+/// Tag for layer i root in streaming mode
+pub const TAG_ROOT_I: &[u8] = b"mle/root_i";  
+/// Tag for layer i+1 root in streaming mode
+pub const TAG_ROOT_IP1: &[u8] = b"mle/root_ip1";
 
 /// Zero-knowledge mode for the Hash-MLE PCS
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ZkMode {
   /// Leak-reduced mode: reveals O(m) dense fold values during evaluation
   LeakReduced,
+  /// Leak-reduced streaming mode: per-layer challenge schedule for streaming proof generation
+  LeakReducedStreaming,
 }
 
 /// Commitment key for Hash-MLE PCS
@@ -114,9 +120,12 @@ pub struct HashMleCommitment<E: Engine> {
 
 impl<E: Engine> TranscriptReprTrait<E::GE> for HashMleCommitment<E> {
   fn to_transcript_bytes(&self) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2 + 32);
+    let mut out = Vec::with_capacity(TAG_MODE.len() + 1 + 32);
     out.extend_from_slice(TAG_MODE);
-    out.push(match self.mode { ZkMode::LeakReduced => 0 });
+    out.push(match self.mode { 
+      ZkMode::LeakReduced => 0,
+      ZkMode::LeakReducedStreaming => 1,
+    });
     out.extend_from_slice(&self.base_root.0);
     out
   }
@@ -227,11 +236,18 @@ impl MerkleTree {
     layers.push(cur.clone());
     
     while cur.len() > 1 {
-      cur = cur
-        .chunks_exact(2)
-        .map(|p| node_digest::<E, B>(&p[0], &p[1]))
-        .collect::<Vec<_>>();
-      layers.push(cur.clone());
+      // Keep all cores busy per level - use parallelism threshold to avoid overhead on tiny levels
+      let next = if cur.len() >= 4096 {
+        cur.par_chunks_exact(2)
+          .map(|p| node_digest::<E, B>(&p[0], &p[1]))
+          .collect::<Vec<_>>()
+      } else {
+        cur.chunks_exact(2)
+          .map(|p| node_digest::<E, B>(&p[0], &p[1]))
+          .collect::<Vec<_>>()
+      };
+      layers.push(next.clone());
+      cur = next;
     }
     
     Self { leaves, layers }
@@ -401,13 +417,19 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePCS<E> {
   }
 
   fn prove(
-    _ck: &Self::CommitmentKey,
+    ck: &Self::CommitmentKey,
     transcript: &mut E::TE,
     comm: &Self::Commitment,
     poly: &[E::Scalar],
-    _blind: &Self::Blind,
+    blind: &Self::Blind,
     point: &[E::Scalar],
   ) -> Result<(E::Scalar, Self::EvaluationArgument), SpartanError> {
+    // Check if streaming mode is enabled
+    if matches!(ck.zk_mode, ZkMode::LeakReducedStreaming) {
+      return HashMlePCS::<E>::prove_streaming(ck, transcript, comm, poly, blind, point);
+    }
+    
+    // Continue with traditional LeakReduced mode
     let n = poly.len();
     let m = point.len();
     if n != (1usize << m) {
@@ -553,7 +575,16 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePCS<E> {
     }
 
     transcript.absorb(b"poly_com", comm);
-    transcript.absorb(TAG_LAYER_ROOTS, &arg.layer_roots.as_slice());
+    
+    // Choose transcript schedule based on mode
+    match comm.mode {
+      ZkMode::LeakReduced => {
+        transcript.absorb(TAG_LAYER_ROOTS, &arg.layer_roots.as_slice());
+      }
+      ZkMode::LeakReducedStreaming => {
+        // no global absorb; we'll absorb per-layer below
+      }
+    }
 
     // Layer 0 root must match the commitment's root
     if arg.layer_roots[0].0 != comm.base_root.0 {
@@ -566,6 +597,13 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePCS<E> {
       let stride = layer_size / 2;
       let expected_depth = m - i;
       let expected_next_depth = m - i - 1;
+      
+      // In streaming mode, bind the per-layer pair BEFORE drawing the K indices,
+      // exactly like the prover did.
+      if matches!(comm.mode, ZkMode::LeakReducedStreaming) {
+        transcript.absorb(TAG_ROOT_I, &arg.layer_roots[i]);
+        transcript.absorb(TAG_ROOT_IP1, &arg.layer_roots[i+1]);
+      }
       
       for _j in 0..K_SAMPLES_PER_ROUND {
         // Re-derive the same random index from transcript (unbiased)
@@ -682,6 +720,119 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePCS<E> {
   }
 }
 
+/// Additional methods for HashMlePCS
+impl<E: Engine> HashMlePCS<E> {
+  /// Streaming prove method for LeakReducedStreaming mode
+  /// Processes layers pair-wise to reduce memory footprint
+  pub fn prove_streaming(
+    _ck: &HashMleCommitmentKey<E>,
+    transcript: &mut E::TE,
+    comm: &HashMleCommitment<E>,
+    poly: &[E::Scalar],
+    _blind: &HashMleBlind<E>,
+    point: &[E::Scalar],
+  ) -> Result<(<E as Engine>::Scalar, HashMleEvaluationArgument<E>), SpartanError> {
+    let n = poly.len();
+    let m = point.len();
+    if n != (1usize << m) {
+      return Err(SpartanError::InvalidInputLength {
+        reason: format!("HashMlePCS::prove_streaming expected {} elements, got {}", 1usize << m, n)
+      });
+    }
+    
+    transcript.absorb(b"poly_com", comm);
+
+    // Use the MultilinearPolynomial's own evaluation method to get the correct result
+    let mle = MultilinearPolynomial::new(poly.to_vec());
+    let expected_eval = mle.evaluate(point);
+
+    let mut layer_roots = Vec::with_capacity(m + 1);
+    let mut rounds = Vec::with_capacity(m);
+    let mut samples = Vec::with_capacity(m);
+
+    // Start with the base layer
+    let mut current_layer = poly.to_vec();
+    
+    // Process each layer pair (i, i+1) for streaming
+    for i in 0..m {
+      let r_i = point[i];
+      
+      // Build tree for current layer
+      let current_leaves = current_layer.par_iter().map(|x| {
+        let x_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(x);
+        leaf_digest::<E, DefaultBackend<E>>(&x_fe)
+      }).collect::<Vec<_>>();
+      let current_tree = MerkleTree::from_leaves::<E, DefaultBackend<E>>(current_leaves);
+      let current_root = MerkleRoot(current_tree.root().0);
+      
+      // Fold to next layer
+      let next_layer = fold_layer::<E>(&current_layer, &r_i);
+      
+      // Build tree for next layer
+      let next_leaves = next_layer.par_iter().map(|x| {
+        let x_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(x);
+        leaf_digest::<E, DefaultBackend<E>>(&x_fe)
+      }).collect::<Vec<_>>();
+      let next_tree = MerkleTree::from_leaves::<E, DefaultBackend<E>>(next_leaves);
+      let next_root = MerkleRoot(next_tree.root().0);
+      
+      // Store roots for this layer pair
+      if i == 0 { layer_roots.push(current_root.clone()); }
+      layer_roots.push(next_root.clone());
+      
+      // Absorb per-layer tags for streaming schedule
+      transcript.absorb(TAG_ROOT_I, &current_root);
+      transcript.absorb(TAG_ROOT_IP1, &next_root);
+      
+      // Generate samples for this layer pair  
+      // Use the module-level constant to maintain soundness (48 samples)
+      let mut round_samples = Vec::with_capacity(K_SAMPLES_PER_ROUND);
+      
+      for _j in 0..K_SAMPLES_PER_ROUND {
+        let stride = current_layer.len() / 2; 
+        let idx = draw_index::<E>(transcript, b"mle/fold_sample", stride)?;
+        let idx_next = idx;
+        
+        let a = current_layer[idx];
+        let b = current_layer[idx + stride];
+        let next = next_layer[idx_next];
+        
+        let sample = SampleOpening {
+          idx: idx as u64,
+          a, b, next,
+          path_a: current_tree.open(idx),
+          path_b: current_tree.open(idx + stride),
+          path_next: next_tree.open(idx_next),
+        };
+        round_samples.push(sample);
+      }
+      
+      samples.push(round_samples);
+      
+      // Create round entry for backwards compatibility
+      let round = Round {
+        a: current_layer[0],
+        b: current_layer[current_layer.len() / 2],
+        path_a: current_tree.open(0),
+        path_b: current_tree.open(current_layer.len() / 2),
+        next: next_layer[0],
+        path_next: next_tree.open(0),
+      };
+      rounds.push(round);
+      
+      // Move to next iteration (discard current layer tree to save memory)
+      current_layer = next_layer;
+    }
+
+    // Safety check: ensure we have exactly m+1 layer roots
+    debug_assert_eq!(layer_roots.len(), m + 1, "Streaming prover must produce exactly m+1 layer roots");
+
+    let eval = expected_eval;
+    let arg = HashMleEvaluationArgument { layer_roots, rounds, samples };
+    Ok((eval, arg))
+  }
+}
+
 // Note: Merkle PCS is not linearly homomorphic, so we do NOT implement FoldingEngineTrait.
 
 #[cfg(test)]
@@ -720,6 +871,147 @@ mod tests {
 
     let mut tr2 = <E as Engine>::TE::new(b"test");
     <HashMlePCS<E> as PCSEngineTrait<E>>::verify(&vk, &mut tr2, &com, &point, &eval, &arg).unwrap();
+  }
+
+  #[test]
+  fn test_streaming_mode_roundtrip() {
+    let m = 8usize; 
+    let n = 1usize << m;
+    let poly = (0..n).map(|i| <E as Engine>::Scalar::from(i as u64)).collect::<Vec<_>>();
+    let point = (0..m).map(|i| <E as Engine>::Scalar::from((i+1) as u64)).collect::<Vec<_>>();
+
+    // Build commitment key with LeakReducedStreaming mode
+    let ck = HashMleCommitmentKey { 
+      branching: 2, 
+      zk_mode: ZkMode::LeakReducedStreaming, 
+      _p: PhantomData 
+    };
+    let vk = HashMleVerifierKey { 
+      branching: 2, 
+      zk_mode: ZkMode::LeakReducedStreaming, 
+      _p: PhantomData 
+    };
+    let blind = <HashMlePCS<E> as PCSEngineTrait<E>>::blind(&ck, n);
+
+    // Commit in streaming mode - the commitment itself is the same, but mode is recorded
+    let mut tr = <E as Engine>::TE::new(b"streaming_test");
+    let com = <HashMlePCS<E> as PCSEngineTrait<E>>::commit(&ck, &poly, &blind, false).unwrap();
+    
+    // Verify the commitment has the correct mode
+    assert_eq!(com.mode, ZkMode::LeakReducedStreaming);
+    
+    // Prove in streaming mode (should call prove_streaming internally)
+    let (eval, arg) = <HashMlePCS<E> as PCSEngineTrait<E>>::prove(&ck, &mut tr, &com, &poly, &blind, &point).unwrap();
+
+    // Verify in streaming mode
+    let mut tr2 = <E as Engine>::TE::new(b"streaming_test");
+    <HashMlePCS<E> as PCSEngineTrait<E>>::verify(&vk, &mut tr2, &com, &point, &eval, &arg).unwrap();
+    
+    // Verify that the evaluation is the same as the regular MLE polynomial evaluation
+    let mle = MultilinearPolynomial::new(poly);
+    let expected_eval = mle.evaluate(&point);
+    assert_eq!(eval, expected_eval);
+  }
+
+  #[test]
+  fn test_cross_mode_mismatch() {
+    let m = 6usize; 
+    let n = 1usize << m;
+    let poly = (0..n).map(|i| <E as Engine>::Scalar::from(i as u64)).collect::<Vec<_>>();
+    let point = (0..m).map(|i| <E as Engine>::Scalar::from((i+1) as u64)).collect::<Vec<_>>();
+
+    // Build commitment key and verifier key with different modes (should fail)
+    let ck_streaming = HashMleCommitmentKey { 
+      branching: 2, 
+      zk_mode: ZkMode::LeakReducedStreaming, 
+      _p: PhantomData 
+    };
+    let vk_regular = HashMleVerifierKey { 
+      branching: 2, 
+      zk_mode: ZkMode::LeakReduced, 
+      _p: PhantomData 
+    };
+    let blind = <HashMlePCS<E> as PCSEngineTrait<E>>::blind(&ck_streaming, n);
+
+    // Prove in streaming mode
+    let mut tr = <E as Engine>::TE::new(b"cross_mode_test");
+    let com = <HashMlePCS<E> as PCSEngineTrait<E>>::commit(&ck_streaming, &poly, &blind, false).unwrap();
+    let (eval, arg) = <HashMlePCS<E> as PCSEngineTrait<E>>::prove(&ck_streaming, &mut tr, &com, &poly, &blind, &point).unwrap();
+
+    // Try to verify with mismatched mode - should fail
+    let mut tr2 = <E as Engine>::TE::new(b"cross_mode_test");
+    let result = <HashMlePCS<E> as PCSEngineTrait<E>>::verify(&vk_regular, &mut tr2, &com, &point, &eval, &arg);
+    assert!(result.is_err(), "Cross-mode verification should fail at mode check");
+  }
+
+  #[test] 
+  fn test_streaming_determinism() {
+    let m = 7usize; 
+    let n = 1usize << m;
+    let poly = (0..n).map(|i| <E as Engine>::Scalar::from((i * 17 + 42) as u64)).collect::<Vec<_>>();
+    let point = (0..m).map(|i| <E as Engine>::Scalar::from((i * 3 + 7) as u64)).collect::<Vec<_>>();
+
+    let ck = HashMleCommitmentKey { 
+      branching: 2, 
+      zk_mode: ZkMode::LeakReducedStreaming, 
+      _p: PhantomData 
+    };
+    let blind = <HashMlePCS<E> as PCSEngineTrait<E>>::blind(&ck, n);
+    let com = <HashMlePCS<E> as PCSEngineTrait<E>>::commit(&ck, &poly, &blind, false).unwrap();
+
+    // Run streaming proof twice with identical inputs
+    let mut tr1 = <E as Engine>::TE::new(b"determinism_test");
+    let (_eval1, arg1) = <HashMlePCS<E> as PCSEngineTrait<E>>::prove(&ck, &mut tr1, &com, &poly, &blind, &point).unwrap();
+
+    let mut tr2 = <E as Engine>::TE::new(b"determinism_test");
+    let (_eval2, arg2) = <HashMlePCS<E> as PCSEngineTrait<E>>::prove(&ck, &mut tr2, &com, &poly, &blind, &point).unwrap();
+
+    // Sample indices should be identical (transcript determinism)
+    assert_eq!(arg1.samples.len(), arg2.samples.len());
+    for (round1, round2) in arg1.samples.iter().zip(arg2.samples.iter()) {
+      assert_eq!(round1.len(), round2.len());
+      for (sample1, sample2) in round1.iter().zip(round2.iter()) {
+        assert_eq!(sample1.idx, sample2.idx, "Sample indices must be deterministic");
+      }
+    }
+  }
+
+  #[test]
+  fn test_draw_index_distribution() {
+    use std::collections::HashMap;
+    
+    // Sanity test that draw_index produces reasonable distribution (not perfect uniformity)
+    let mut transcript = <E as Engine>::TE::new(b"distribution_test");
+    let stride = 16; // Smaller stride for better statistics
+    let num_samples = 1000;
+    let mut counts = HashMap::new();
+    
+    // Draw many indices and count frequency
+    for _i in 0..num_samples {
+      let idx = draw_index::<E>(&mut transcript, b"test_draw", stride).unwrap();
+      assert!(idx < stride, "Index must be in bounds");
+      *counts.entry(idx).or_insert(0) += 1;
+    }
+    
+    // Sanity checks: no bucket should be completely empty or extremely over-represented
+    let expected = num_samples / stride;
+    let min_reasonable = expected / 4; // 25% of expected (very loose)
+    let max_reasonable = expected * 4;  // 400% of expected (very loose)
+    
+    for bucket in 0..stride {
+      let count = counts.get(&bucket).copied().unwrap_or(0);
+      assert!(
+        count >= min_reasonable && count <= max_reasonable,
+        "Bucket {} has count {} which is outside reasonable range [{}, {}]", 
+        bucket, count, min_reasonable, max_reasonable
+      );
+    }
+    
+    // Ensure we actually hit most buckets (not just a few)
+    let non_empty_buckets = counts.len();
+    assert!(non_empty_buckets >= stride * 3 / 4, 
+           "Only {} out of {} buckets used - distribution too concentrated", 
+           non_empty_buckets, stride);
   }
 
   #[test]

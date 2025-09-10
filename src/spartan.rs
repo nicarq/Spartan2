@@ -87,35 +87,37 @@ pub(crate) fn compute_eval_table_sparse<E: Engine>(
 ) -> (Vec<E::Scalar>, Vec<E::Scalar>, Vec<E::Scalar>) {
   assert_eq!(rx.len(), S.num_cons);
 
-  let inner = |M: &SparseMatrix<E::Scalar>, M_evals: &mut Vec<E::Scalar>| {
-    for (row_idx, ptrs) in M.indptr.windows(2).enumerate() {
-      for (val, col_idx) in M.get_row_unchecked(ptrs.try_into().unwrap()) {
-        M_evals[*col_idx] += rx[row_idx] * val;
-      }
-    }
+  let inner = |M: &SparseMatrix<E::Scalar>| -> Vec<E::Scalar> {
+    let cols = 2 * (S.num_shared + S.num_precommitted + S.num_rest);
+    
+    // Row-parallel fold/reduce: O(nnz) work, O(p × cols) memory - optimal trade-off
+    M.indptr
+      .par_windows(2)
+      .enumerate()
+      .fold(
+        || vec![E::Scalar::ZERO; cols],
+        |mut acc, (row_idx, ptrs)| {
+          let rxr = rx[row_idx];
+          for (val, col_idx) in M.get_row_unchecked(ptrs.try_into().unwrap()) {
+            acc[*col_idx] += rxr * *val;
+          }
+          acc
+        }
+      )
+      .reduce(
+        || vec![E::Scalar::ZERO; cols],
+        |mut a, b| {
+          for (a_elem, b_elem) in a.iter_mut().zip(b.iter()) {
+            *a_elem += *b_elem;
+          }
+          a
+        }
+      )
   };
 
-  let num_vars = S.num_shared + S.num_precommitted + S.num_rest;
   let (A_evals, (B_evals, C_evals)) = rayon::join(
-    || {
-      let mut A_evals: Vec<E::Scalar> = vec![E::Scalar::ZERO; 2 * num_vars];
-      inner(&S.A, &mut A_evals);
-      A_evals
-    },
-    || {
-      rayon::join(
-        || {
-          let mut B_evals: Vec<E::Scalar> = vec![E::Scalar::ZERO; 2 * num_vars];
-          inner(&S.B, &mut B_evals);
-          B_evals
-        },
-        || {
-          let mut C_evals: Vec<E::Scalar> = vec![E::Scalar::ZERO; 2 * num_vars];
-          inner(&S.C, &mut C_evals);
-          C_evals
-        },
-      )
-    },
+    || inner(&S.A),
+    || rayon::join(|| inner(&S.B), || inner(&S.C)),
   );
 
   (A_evals, B_evals, C_evals)
@@ -325,17 +327,12 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
     let (evals_A, evals_B, evals_C) = compute_eval_table_sparse(&pk.S, &evals_rx);
     info!(elapsed_ms = %sparse_t.elapsed().as_millis(), "compute_eval_table_sparse");
 
-    let (_abc_span, abc_t) = start_span!("prepare_poly_ABC");
+    // Skip poly_ABC materialization - use streaming sum-check instead
     assert_eq!(evals_A.len(), evals_B.len());
     assert_eq!(evals_A.len(), evals_C.len());
-    let poly_ABC = (0..evals_A.len())
-      .into_par_iter()
-      .map(|i| evals_A[i] + r * evals_B[i] + r * r * evals_C[i])
-      .collect::<Vec<E::Scalar>>();
-    info!(elapsed_ms = %abc_t.elapsed().as_millis(), "prepare_poly_ABC");
 
     let (_z_span, z_t) = start_span!("prepare_poly_z");
-    let poly_z = if is_hash_mle_engine {
+    let mut poly_z = if is_hash_mle_engine {
       // Hash-MLE engines need MSB-gated Z polynomial construction  
       // Build W(·) and X(·), then concatenate by the gating bit y0 as MSB
       // This creates Z(y_0, y) = (1-y_0)*W(y) + y_0*X(y) where y_0 is r_y[0] (MSB convention)
@@ -402,26 +399,34 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
 
     debug!("Proving inner sum-check with {} rounds", num_rounds_y);
     debug!(
-      "Inner sum-check sizes - poly_ABC: {}, poly_z: {}",
-      poly_ABC.len(),
+      "Inner sum-check sizes - evals_A: {}, poly_z: {}",
+      evals_A.len(),
       poly_z.len()
     );
     let comb_func = |poly_A_comp: &E::Scalar, poly_B_comp: &E::Scalar| -> E::Scalar {
       *poly_A_comp * *poly_B_comp
     };
+    
+    // Create streaming accessor for poly_ABC computation 
+    let r2 = r * r;
+    let a_at = |i: usize| evals_A[i] + r * evals_B[i] + r2 * evals_C[i];
+    let z_at = |i: usize| poly_z[i];
+    
     // Compute the true dot-product sum as the inner claim
-    let claim_inner_sum: E::Scalar = poly_ABC.par_iter()
-        .zip(&poly_z)
-        .map(|(a, z)| *a * *z)
+    let claim_inner_sum: E::Scalar = (0..evals_A.len()).into_par_iter()
+        .map(|i| a_at(i) * z_at(i))
         .sum();
     
-    // Clone poly_z for debug assertions later  
-    let _poly_z_for_debug = poly_z.clone();
-    let (sc_proof_inner, r_y, _claims_inner) = SumcheckProof::prove_quad(
+    // Use in-place variant to eliminate poly_z duplication for better memory efficiency
+    #[cfg(debug_assertions)]
+    let _poly_z_for_debug = poly_z.clone(); // Only clone for debug mode
+    
+    let (sc_proof_inner, r_y, _claims_inner) = SumcheckProof::prove_quad_streaming_inplace(
       &claim_inner_sum,                 // ✅ correct dot-product sum
       num_rounds_y,
-      &mut MultilinearPolynomial::new(poly_ABC),
-      &mut MultilinearPolynomial::new(poly_z),
+      evals_A.len(),
+      a_at,
+      &mut poly_z,                     // 🚀 In-place binding - no duplication!
       comb_func,
       &mut t_sc,
     )?;
@@ -433,10 +438,17 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
 
     // Gate bit is y0 (the first coordinate). MultilinearPolynomial::evaluate folds MSB-first:
     // the first variable splits the table into left|right halves. Our Z = [W | X] uses this split.
-    let (gate, ry_no_gate): (E::Scalar, &[E::Scalar]) = if r_y.is_empty() {
-        (E::Scalar::ZERO, &[])
+    let ry_no_gate: &[E::Scalar] = if r_y.is_empty() {
+        &[]
     } else {
-        (r_y[0], &r_y[1..])
+        &r_y[1..]
+    };
+
+    #[cfg(debug_assertions)]
+    let gate: E::Scalar = if r_y.is_empty() {
+        E::Scalar::ZERO
+    } else {
+        r_y[0]
     };
 
     #[cfg(debug_assertions)]
@@ -460,7 +472,7 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
     if is_hash_mle_engine && num_vars > 0 {
       println!("🔍 PROVER: Starting Z polynomial consistency check...");
 
-      // Evaluate X on the non-gate coordinates (y1..)
+      #[cfg(debug_assertions)]
       let eval_X_check = {
         let mut X_full = vec![E::Scalar::ZERO; num_vars];
         match U_regular.X.len() {
@@ -475,35 +487,38 @@ impl<E: Engine> R1CSSNARKTrait<E> for R1CSSNARK<E> {
         }
         crate::polys::multilinear::MultilinearPolynomial::new(X_full).evaluate(ry_no_gate)
       };
-      let eval_Z_expected = (E::Scalar::ONE - gate) * eval_W + gate * eval_X_check;
-      let eval_Z_table = crate::polys::multilinear::MultilinearPolynomial::new(_poly_z_for_debug.clone()).evaluate(&r_y);
-      
-      println!("🔍 PROVER Z consistency check:");
-      println!("  eval_W = {:?}", eval_W);
-      println!("  eval_X_check = {:?}", eval_X_check); 
-      println!("  gate (y0) = {:?}", gate);
-      println!("  (1 - gate) * eval_W = {:?}", (E::Scalar::ONE - gate) * eval_W);
-      println!("  gate * eval_X_check = {:?}", gate * eval_X_check);
-      println!("  eval_Z_expected (analytical) = {:?}", eval_Z_expected);
-      println!("  eval_Z_table (from poly_z) = {:?}", eval_Z_table);
-      
-      if eval_Z_expected == eval_Z_table {
-        println!("✅ PROVER: Z polynomial consistency verified!");
-      } else {
-        println!("❌ PROVER: Z polynomial MISMATCH!");
-        println!("  Difference = {:?}", eval_Z_expected - eval_Z_table);
-      }
-      
-      // Sanity display
-      println!("🔧 GATING SANITY:");
-      println!("  gate (y0) = {:?}", gate);
-      println!("  Table eval_Z = {:?}", eval_Z_table);
-      println!("  Expected (from W@y1.., X@y1..) = {:?}", eval_Z_expected);
-      
-      if eval_Z_expected == eval_Z_table {
-        println!("✅ Gating with y0 is CORRECT.");
-      } else {
-        println!("❌ Z mismatch persists (should not happen after fix).");
+      #[cfg(debug_assertions)]
+      {
+        let eval_Z_expected = (E::Scalar::ONE - gate) * eval_W + gate * eval_X_check;
+        let eval_Z_table = crate::polys::multilinear::MultilinearPolynomial::new(_poly_z_for_debug.clone()).evaluate(&r_y);
+        
+        println!("🔍 PROVER Z consistency check:");
+        println!("  eval_W = {:?}", eval_W);
+        println!("  eval_X_check = {:?}", eval_X_check); 
+        println!("  gate (y0) = {:?}", gate);
+        println!("  (1 - gate) * eval_W = {:?}", (E::Scalar::ONE - gate) * eval_W);
+        println!("  gate * eval_X_check = {:?}", gate * eval_X_check);
+        println!("  eval_Z_expected (analytical) = {:?}", eval_Z_expected);
+        println!("  eval_Z_table (from poly_z) = {:?}", eval_Z_table);
+        
+        if eval_Z_expected == eval_Z_table {
+          println!("✅ PROVER: Z polynomial consistency verified!");
+        } else {
+          println!("❌ PROVER: Z polynomial MISMATCH!");
+          println!("  Difference = {:?}", eval_Z_expected - eval_Z_table);
+        }
+        
+        // Sanity display inside debug block
+        println!("🔧 GATING SANITY:");
+        println!("  gate (y0) = {:?}", gate);
+        println!("  Table eval_Z = {:?}", eval_Z_table);
+        println!("  Expected (from W@y1.., X@y1..) = {:?}", eval_Z_expected);
+        
+        if eval_Z_expected == eval_Z_table {
+          println!("✅ Gating with y0 is CORRECT.");
+        } else {
+          println!("❌ Z mismatch persists (should not happen after fix).");
+        }
       }
       
       // Don't assert for now - just identify which works
@@ -850,11 +865,12 @@ mod tests {
     // This specifically exercises Hash-MLE engines where transcript interleaving
     // between inner sumcheck and PCS could cause different r_y values
     
-    tracing_subscriber::fmt()
+    // Try to initialize tracing, but don't fail if already set by another test
+    let _ = tracing_subscriber::fmt()
       .with_target(false)
       .with_ansi(true)
       .with_env_filter(EnvFilter::from_default_env())
-      .init();
+      .try_init();
 
     type E = crate::provider::GoldilocksMerkleMleEngine;
     type S = R1CSSNARK<E>;

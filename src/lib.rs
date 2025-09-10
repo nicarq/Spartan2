@@ -50,3 +50,22 @@ type Commitment<E> = <<E as Engine>::PCS as PCSEngineTrait<E>>::Commitment;
 type PartialCommitment<E> = <<E as Engine>::PCS as PCSEngineTrait<E>>::PartialCommitment;
 type PCS<E> = <E as Engine>::PCS;
 type Blind<E> = <<E as Engine>::PCS as PCSEngineTrait<E>>::Blind;
+
+// ================================================================================================
+// PUBLIC API RE-EXPORTS FOR EXTERNAL PROJECTS
+// ================================================================================================
+
+/// R1CS constraint system shape - defines the structure of your circuit
+pub use r1cs::R1CSShape;
+
+/// R1CS instance - contains the public inputs to your circuit  
+pub use r1cs::R1CSInstance;
+
+/// R1CS witness - contains the private witness (secret inputs) to your circuit
+pub use r1cs::R1CSWitness;
+
+/// Split R1CS shape for bellpepper circuits with precommitted variables
+pub use r1cs::SplitR1CSShape;
+
+/// Split R1CS instance for bellpepper circuits with precommitted variables
+pub use r1cs::SplitR1CSInstance;

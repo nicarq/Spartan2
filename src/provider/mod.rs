@@ -1,6 +1,7 @@
 //! This module implements Spartan's traits using the following several different combinations
 
 // public modules to be used as an commitment engine with Spartan
+pub mod goldi;
 pub mod keccak;
 pub mod pasta;
 pub mod pcs;
@@ -13,11 +14,14 @@ use crate::{
   provider::{
     keccak::Keccak256Transcript,
     pasta::{pallas, vesta},
-    pcs::hyrax_pc::HyraxPCS,
+    pcs::{hyrax_pc::HyraxPCS, merkle_mle_pc::HashMlePCS},
     pt256::{p256, t256},
   },
   traits::Engine,
 };
+
+#[cfg(feature = "p3_backend")]
+use crate::provider::pcs::merkle_mle_pc_p3::HashMlePcsP3;
 use core::fmt::Debug;
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +71,80 @@ impl Engine for T256HyraxEngine {
   type GE = t256::Point;
   type TE = Keccak256Transcript<Self>;
   type PCS = HyraxPCS<Self>;
+}
+
+/// An implementation of the Spartan Engine trait with Pallas curve and Hash-MLE PCS (Keccak Merkle)
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PallasMerkleMleEngine;
+
+/// An implementation of the Spartan Engine trait with Vesta curve and Hash-MLE PCS
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VestaMerkleMleEngine;
+
+/// An implementation of the Spartan Engine trait with P256 curve and Hash-MLE PCS
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct P256MerkleMleEngine;
+
+/// An implementation of the Spartan Engine trait with T256 curve and Hash-MLE PCS
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct T256MerkleMleEngine;
+
+impl Engine for PallasMerkleMleEngine {
+  type Base = pallas::Base;
+  type Scalar = pallas::Scalar;
+  type GE = pallas::Point;
+  type TE = Keccak256Transcript<Self>;
+  type PCS = HashMlePCS<Self>;
+}
+
+impl Engine for VestaMerkleMleEngine {
+  type Base = vesta::Base;
+  type Scalar = vesta::Scalar;
+  type GE = vesta::Point;
+  type TE = Keccak256Transcript<Self>;
+  type PCS = HashMlePCS<Self>;
+}
+
+impl Engine for P256MerkleMleEngine {
+  type Base = p256::Base;
+  type Scalar = p256::Scalar;
+  type GE = p256::Point;
+  type TE = Keccak256Transcript<Self>;
+  type PCS = HashMlePCS<Self>;
+}
+
+impl Engine for T256MerkleMleEngine {
+  type Base = t256::Base;
+  type Scalar = t256::Scalar;
+  type GE = t256::Point;
+  type TE = Keccak256Transcript<Self>;
+  type PCS = HashMlePCS<Self>;
+}
+
+/// An implementation of the Spartan Engine trait with Goldilocks field and Hash-MLE PCS (Keccak)
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GoldilocksMerkleMleEngine;
+
+impl Engine for GoldilocksMerkleMleEngine {
+  type Base = crate::provider::goldi::F;
+  type Scalar = crate::provider::goldi::F;
+  type GE = crate::provider::goldi::UnitPoint;
+  type TE = Keccak256Transcript<Self>;
+  type PCS = HashMlePCS<Self>;
+}
+
+/// An implementation of the Spartan Engine trait with Goldilocks field and Hash-MLE PCS (p3/Poseidon2)
+#[cfg(feature = "p3_backend")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GoldilocksP3MerkleMleEngine;
+
+#[cfg(feature = "p3_backend")]
+impl Engine for GoldilocksP3MerkleMleEngine {
+  type Base = crate::provider::goldi::F;
+  type Scalar = crate::provider::goldi::F;
+  type GE = crate::provider::goldi::UnitPoint;
+  type TE = Keccak256Transcript<Self>;
+  type PCS = HashMlePcsP3<Self>;
 }
 
 /*

@@ -161,6 +161,15 @@ where
         let msm_result = if !is_small {
           E::GE::vartime_multiscalar_mul(scalars, &ck.ck[..scalars.len()], false)?
         } else {
+          // Debug assertion: is_small=true requires scalars to fit in a single byte
+          debug_assert!(
+            scalars.iter().all(|s| {
+              let repr = s.to_repr();
+              repr.as_ref()[1..].iter().all(|&b| b == 0)
+            }),
+            "is_small=true requires scalars < 256"
+          );
+          
           let scalars_small = scalars
             .par_iter()
             .map(|s| s.to_repr().as_ref()[0] as u64)

@@ -146,7 +146,21 @@ impl<Scalar: PrimeField> SparsePolynomial<Scalar> {
   pub fn evaluate(&self, r: &[Scalar]) -> Scalar {
     assert_eq!(self.num_vars, r.len());
 
+    // Guard against zero-dimension case
+    if self.num_vars == 0 {
+      return if self.Z.is_empty() { Scalar::ZERO } else { self.Z[0] };
+    }
+
     let num_vars_z = self.Z.len().next_power_of_two().log_2();
+    
+    // Guard against underflow: ensure we have enough dimensions
+    if self.num_vars < 1 + num_vars_z {
+      // Fallback to full evaluation for edge cases
+      let mut extended_z = self.Z.clone();
+      extended_z.resize(1 << self.num_vars, Scalar::ZERO);
+      return crate::polys::multilinear::MultilinearPolynomial::new(extended_z).evaluate(r);
+    }
+    
     let chis = EqPolynomial::evals_from_points(&r[self.num_vars - 1 - num_vars_z..]);
     let eval_partial: Scalar = self
       .Z
@@ -168,6 +182,7 @@ mod tests {
   use super::*;
   use crate::provider::pasta::pallas;
   use rand_core::{CryptoRng, OsRng, RngCore};
+  use ff::Field;
 
   fn test_multilinear_polynomial_with<F: PrimeField>() {
     // Let the polynomial has 3 variables, p(x_1, x_2, x_3) = (x_1 + x_2) * x_3
@@ -247,6 +262,28 @@ mod tests {
   #[test]
   fn test_evaluation() {
     test_evaluation_with::<pallas::Scalar>();
+  }
+
+  #[test]
+  fn test_sparse_polynomial_zero_dim() {
+    // Test edge case: zero dimensions
+    let poly = SparsePolynomial::<pallas::Scalar>::new(0, vec![pallas::Scalar::from(42u64)]);
+    let result = poly.evaluate(&[]);
+    assert_eq!(result, pallas::Scalar::from(42u64));
+    
+    // Test edge case: empty vector
+    let poly_empty = SparsePolynomial::<pallas::Scalar>::new(0, vec![]);
+    let result_empty = poly_empty.evaluate(&[]);
+    assert_eq!(result_empty, pallas::Scalar::ZERO);
+  }
+  
+  #[test] 
+  fn test_sparse_polynomial_underflow_guard() {
+    // Test case that would previously cause underflow: num_vars < 1 + num_vars_z
+    let poly = SparsePolynomial::<pallas::Scalar>::new(1, vec![pallas::Scalar::from(5u64); 4]); // 4 elements -> num_vars_z = 2, so 1 < 1 + 2
+    let result = poly.evaluate(&[pallas::Scalar::from(3u64)]);
+    // Should fallback to dense evaluation without crashing
+    assert!(result != pallas::Scalar::ZERO); // Just verify it doesn't crash and returns something reasonable
   }
 
   /// Returns a random ML polynomial

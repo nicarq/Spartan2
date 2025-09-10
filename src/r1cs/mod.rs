@@ -251,6 +251,8 @@ impl<E: Engine> R1CSShape<E> {
     E::PCS::setup(b"ck", self.num_vars)
   }
 
+  /// Multiplies the R1CS matrices A, B, C with the given vector z
+  /// Returns (Az, Bz, Cz) where each is the result of matrix-vector multiplication
   pub fn multiply_vec(
     &self,
     z: &[E::Scalar],
@@ -585,6 +587,8 @@ impl<E: Engine> SplitR1CSShape<E> {
     })
   }
 
+  /// Equalizes the dimensions of two SplitR1CSShape instances by padding them to the same size
+  /// This ensures both shapes have the same number of constraints and variables
   pub fn equalize(S_A: &mut Self, S_B: &mut Self) {
     let num_cons_padded = max(S_A.num_cons, S_B.num_cons);
     let num_vars_padded = max(
@@ -636,6 +640,7 @@ impl<E: Engine> SplitR1CSShape<E> {
     }
   }
 
+  /// Converts this SplitR1CSShape to a regular R1CSShape by combining all variable types
   pub fn to_regular_shape(&self) -> R1CSShape<E> {
     R1CSShape {
       num_cons: self.num_cons,
@@ -705,6 +710,8 @@ impl<E: Engine> SplitR1CSShape<E> {
     Ok(E::PCS::setup(b"ck", max))
   }
 
+  /// Multiplies the split R1CS matrices A, B, C with the given vector z
+  /// Returns (Az, Bz, Cz) where each is the result of matrix-vector multiplication
   pub fn multiply_vec(
     &self,
     z: &[E::Scalar],
@@ -787,6 +794,8 @@ impl<E: Engine> SplitR1CSInstance<E> {
     })
   }
 
+  /// Validates this SplitR1CSInstance against the given SplitR1CSShape
+  /// Absorbs public values and commitments into the transcript for verification
   pub fn validate(
     &self,
     S: &SplitR1CSShape<E>,
@@ -835,6 +844,7 @@ impl<E: Engine> SplitR1CSInstance<E> {
     Ok(())
   }
 
+  /// Converts this SplitR1CSInstance to a regular R1CSInstance by combining partial commitments
   pub fn to_regular_instance(&self) -> Result<R1CSInstance<E>, SpartanError> {
     let partial_comms = [
       self.comm_W_shared.clone(),

@@ -173,6 +173,258 @@ impl<E: Engine> SumcheckProof<E> {
     )
   }
 
+  /// Streaming variant of quadratic sum-check that avoids materializing large polynomials.
+  /// Instead of taking MultilinearPolynomial objects, it takes functional accessors.
+  ///
+  /// # Arguments  
+  /// * `claim` - The claimed sum that the prover asserts
+  /// * `num_rounds` - The number of variables/rounds in the sum-check
+  /// * `a_len` - Length of the polynomials (must be power of 2)
+  /// * `a_at` - Function to access elements of poly_A: `Fn(usize) -> E::Scalar`
+  /// * `z_at` - Function to access elements of poly_Z: `Fn(usize) -> E::Scalar`  
+  /// * `comb_func` - Function that combines evaluations of the two polynomials
+  /// * `transcript` - The transcript for generating randomness
+  ///
+  /// # Returns
+  /// A tuple containing the sum-check proof, the sequence of verifier challenges,
+  /// and the final evaluations of the polynomials.
+  pub fn prove_quad_streaming<A, Z, F>(
+    claim: &E::Scalar,
+    num_rounds: usize,
+    a_len: usize,
+    a_at: A,
+    z_at: Z,
+    comb_func: F,
+    transcript: &mut E::TE,
+  ) -> Result<(Self, Vec<E::Scalar>, Vec<E::Scalar>), SpartanError>
+  where
+    A: Send + Sync + Fn(usize) -> E::Scalar,
+    Z: Send + Sync + Fn(usize) -> E::Scalar,
+    F: Fn(&E::Scalar, &E::Scalar) -> E::Scalar + Sync + Send + Copy,
+  {
+    if a_len != (1usize << num_rounds) {
+      return Err(SpartanError::InvalidInputLength {
+        reason: format!("prove_quad_streaming: expected length {}, got {}", 1usize << num_rounds, a_len)
+      });
+    }
+
+    let mut r: Vec<E::Scalar> = Vec::new();
+    let mut polys: Vec<CompressedUniPoly<E::Scalar>> = Vec::new();
+    let mut claim_per_round = *claim;
+    let mut current_len = a_len;
+    
+    // z state (owned) — bind in place
+    let mut z: Vec<E::Scalar> = (0..a_len).into_par_iter().map(|i| z_at(i)).collect();
+    // a state — lazily populated: first round from closures, later rounds bound in place
+    let mut a: Vec<E::Scalar> = Vec::new(); // length set after round 0
+
+    for round in 0..num_rounds {
+      let (_round_span, round_t) = start_span!("sumcheck_quad_streaming_round", round = round);
+      
+      let half_len = current_len / 2;
+      let poly = {
+        let (_eval_span, eval_t) = start_span!("compute_eval_points_quad_streaming");
+        
+        let (eval_point_0, eval_point_2) =
+          (0..half_len).into_par_iter().map(|i| {
+            // source of a_low/a_high depends on round
+            let (a_low, a_high) = if a.is_empty() {
+              (a_at(i), a_at(half_len + i))
+            } else {
+              (a[i], a[half_len + i])
+            };
+            let z_low = z[i];
+            let z_high = z[half_len + i];
+            let eval0 = comb_func(&a_low, &z_low);
+            let eval2 = comb_func(&(a_high + a_high - a_low), &(z_high + z_high - z_low));
+            (eval0, eval2)
+          }).reduce(
+            || (E::Scalar::ZERO, E::Scalar::ZERO),
+            |(a0,a2),(b0,b2)| (a0+b0, a2+b2)
+          );
+
+        if eval_t.elapsed().as_millis() > 0 {
+          info!(elapsed_ms = %eval_t.elapsed().as_millis(), "compute_eval_points_quad_streaming");
+        }
+
+        let evals = vec![eval_point_0, claim_per_round - eval_point_0, eval_point_2];
+        UniPoly::from_evals(&evals)?
+      };
+
+      // append the prover's message to the transcript
+      transcript.absorb(b"p", &poly);
+      polys.push(poly.compress());
+
+      // derive the verifier's challenge for the next round
+      let r_i = transcript.squeeze(b"c")?;
+      r.push(r_i);
+
+      // Bind for next round (in place)
+      if round < num_rounds - 1 {
+        if a.is_empty() {
+          // first bind of a from closures
+          a = (0..half_len).into_par_iter().map(|i| {
+            let lo = a_at(i); let hi = a_at(half_len + i);
+            lo + r_i * (hi - lo)
+          }).collect();
+        } else {
+          // Use slicing to avoid closure capture issues
+          for i in 0..half_len {
+            let lo = a[i]; let hi = a[half_len + i];
+            a[i] = lo + r_i * (hi - lo);
+          }
+          a.truncate(half_len);
+        }
+        // Use slicing for z as well
+        for i in 0..half_len {
+          let lo = z[i]; let hi = z[half_len + i];
+          z[i] = lo + r_i * (hi - lo);
+        }
+        z.truncate(half_len);
+      }
+
+      claim_per_round = poly.evaluate(&r_i);
+      current_len = half_len;
+      
+      if round_t.elapsed().as_millis() > 0 {
+        info!(elapsed_ms = %round_t.elapsed().as_millis(), "sumcheck_quad_streaming_round");
+      }
+    }
+
+    // Final evaluations
+    let poly_A_final = if a.is_empty() { a_at(0) } else { a[0] };
+    let poly_B_final = z[0];
+    
+    Ok((
+      SumcheckProof { compressed_polys: polys },
+      r,
+      vec![poly_A_final, poly_B_final],
+    ))
+  }
+
+  /// In-place variant of streaming sum-check that mutates poly_z directly (avoids duplication)
+  pub fn prove_quad_streaming_inplace<A, F>(
+    claim: &E::Scalar,
+    num_rounds: usize,
+    a_len: usize,
+    a_at: A,
+    z: &mut [E::Scalar],  // Mutable slice - will be bound in place
+    comb_func: F,
+    transcript: &mut E::TE,
+  ) -> Result<(Self, Vec<E::Scalar>, Vec<E::Scalar>), SpartanError>
+  where
+    A: Send + Sync + Fn(usize) -> E::Scalar,
+    F: Fn(&E::Scalar, &E::Scalar) -> E::Scalar + Sync + Send + Copy,
+  {
+    if a_len != (1usize << num_rounds) {
+      return Err(SpartanError::InvalidInputLength {
+        reason: format!("prove_quad_streaming_inplace: expected length {}, got {}", 1usize << num_rounds, a_len)
+      });
+    }
+
+    if z.len() != a_len {
+      return Err(SpartanError::InvalidInputLength {
+        reason: format!("prove_quad_streaming_inplace: z length mismatch {} != {}", z.len(), a_len)
+      });
+    }
+
+    let mut r: Vec<E::Scalar> = Vec::new();
+    let mut polys: Vec<CompressedUniPoly<E::Scalar>> = Vec::new();
+    let mut claim_per_round = *claim;
+    let mut current_len = a_len;
+    
+    // a state — lazily populated: first round from closures, later rounds bound in place
+    let mut a: Vec<E::Scalar> = Vec::new(); // length set after round 0
+    
+    // z slice view - shrinks each round to only the active prefix
+    let mut z_view = z;
+
+    for round in 0..num_rounds {
+      let (_round_span, round_t) = start_span!("sumcheck_quad_streaming_inplace_round", round = round);
+      
+      let half_len = current_len / 2;
+      let poly = {
+        let (_eval_span, eval_t) = start_span!("compute_eval_points_quad_streaming_inplace");
+        
+        let (eval_point_0, eval_point_2) =
+          (0..half_len).into_par_iter().map(|i| {
+            // source of a_low/a_high depends on round
+            let (a_low, a_high) = if a.is_empty() {
+              (a_at(i), a_at(half_len + i))
+            } else {
+              (a[i], a[half_len + i])
+            };
+            let z_low = z_view[i];
+            let z_high = z_view[half_len + i];
+            let eval0 = comb_func(&a_low, &z_low);
+            let eval2 = comb_func(&(a_high + a_high - a_low), &(z_high + z_high - z_low));
+            (eval0, eval2)
+          }).reduce(
+            || (E::Scalar::ZERO, E::Scalar::ZERO),
+            |(a0,a2),(b0,b2)| (a0+b0, a2+b2)
+          );
+
+        if eval_t.elapsed().as_millis() > 0 {
+          info!(elapsed_ms = %eval_t.elapsed().as_millis(), "compute_eval_points_quad_streaming_inplace");
+        }
+
+        let evals = vec![eval_point_0, claim_per_round - eval_point_0, eval_point_2];
+        UniPoly::from_evals(&evals)?
+      };
+
+      // append the prover's message to the transcript
+      transcript.absorb(b"p", &poly);
+      polys.push(poly.compress());
+
+      // derive the verifier's challenge for the next round
+      let r_i = transcript.squeeze(b"c")?;
+      r.push(r_i);
+
+      // Bind for next round (in place)
+      if round < num_rounds - 1 {
+        if a.is_empty() {
+          // first bind of a from closures
+          a = (0..half_len).into_par_iter().map(|i| {
+            let lo = a_at(i); let hi = a_at(half_len + i);
+            lo + r_i * (hi - lo)
+          }).collect();
+        } else {
+          // Use slicing to avoid closure capture issues
+          for i in 0..half_len {
+            let lo = a[i]; let hi = a[half_len + i];
+            a[i] = lo + r_i * (hi - lo);
+          }
+          a.truncate(half_len);
+        }
+        
+        // Bind z in place and shrink the live view
+        let (lo, hi) = z_view.split_at_mut(half_len);
+        for i in 0..half_len {
+          let li = lo[i]; let hi_i = hi[i];
+          lo[i] = li + r_i * (hi_i - li);
+        }
+        z_view = lo;
+      }
+
+      claim_per_round = poly.evaluate(&r_i);
+      current_len = half_len;
+      
+      if round_t.elapsed().as_millis() > 0 {
+        info!(elapsed_ms = %round_t.elapsed().as_millis(), "sumcheck_quad_streaming_inplace_round");
+      }
+    }
+
+    // Final evaluations
+    let poly_A_final = if a.is_empty() { a_at(0) } else { a[0] };
+    let poly_B_final = z_view[0];
+    
+    Ok((
+      SumcheckProof { compressed_polys: polys },
+      r,
+      vec![poly_A_final, poly_B_final],
+    ))
+  }
+
   /// Generates a sum-check proof for a quadratic combination of two multilinear polynomials.
   ///
   /// # Arguments

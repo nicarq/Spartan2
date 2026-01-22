@@ -1,9 +1,11 @@
 //! This module provides implementations of polynomial commitment schemes (PCS).
 
 // helper code for polynomial commitment schemes
+#[cfg(not(target_arch = "wasm32"))]
 pub mod ipa;
 
 // implementations of polynomial commitment schemes
+#[cfg(not(target_arch = "wasm32"))]
 pub mod hyrax_pc;
 pub mod merkle_mle_pc;
 

@@ -4,7 +4,7 @@
 //!  - p3_poseidon2_goldilocks: converts E::Scalar <-> p3_goldilocks::Goldilocks and hashes with Poseidon2
 
 use serde::{Deserialize, Serialize};
-use ff::Field;
+use ff::{Field, PrimeField};
 use crate::traits::{Engine, transcript::TranscriptReprTrait};
 
 #[cfg(feature = "p3_backend")]
@@ -103,7 +103,9 @@ impl<E: Engine> MleBackend<E> for BackendFfKeccak<E> {
     use sha3::{Digest, Keccak256};
     let mut hasher = Keccak256::new();
     hasher.update(b"mle/leaf");
-    hasher.update(x.to_transcript_bytes());
+    // Avoid per-leaf heap allocations from `to_transcript_bytes()` (hot path).
+    let repr = x.to_repr();
+    hasher.update(repr.as_ref());
     Digest32(hasher.finalize().into())
   }
 

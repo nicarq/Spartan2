@@ -49,13 +49,23 @@ where
       return Err(SpartanError::InvalidInputLength { reason: "HashMlePCS_P3: vector len must be power of two".into() });
     }
     // Convert leaves to p3 field and hash with Poseidon2
-    let leaves = v_ff
-      .par_iter()
-      .map(|x| {
-        let x_fe = <P3B<E> as MleBackend<E>>::fe_from_ff(x);
-        super::merkle_mle_pc::leaf_digest::<E, P3B<E>>(&x_fe)
-      })
-      .collect::<Vec<_>>();
+    let leaves = if crate::parallel::parallelism_enabled() {
+      v_ff
+        .par_iter()
+        .map(|x| {
+          let x_fe = <P3B<E> as MleBackend<E>>::fe_from_ff(x);
+          super::merkle_mle_pc::leaf_digest::<E, P3B<E>>(&x_fe)
+        })
+        .collect::<Vec<_>>()
+    } else {
+      v_ff
+        .iter()
+        .map(|x| {
+          let x_fe = <P3B<E> as MleBackend<E>>::fe_from_ff(x);
+          super::merkle_mle_pc::leaf_digest::<E, P3B<E>>(&x_fe)
+        })
+        .collect::<Vec<_>>()
+    };
 
     let tree = super::merkle_mle_pc::MerkleTree::from_leaves::<E, P3B<E>>(leaves);
     let base_root = MerkleRoot(tree.root().0);
@@ -118,11 +128,19 @@ where
     for &r in &point {
       let n2 = cur.len() / 2;
       let mut next = Vec::with_capacity(n2);
-      next.par_extend((0..n2).into_par_iter().map(|i| {
-        let a = cur[i]; let b = cur[i + n2];
-        // (1-r)*a + r*b  ==  a + r*(b-a)
-        P3B::<E>::add(a, P3B::<E>::mul(r, P3B::<E>::sub(b, a)))
-      }));
+      if crate::parallel::parallelism_enabled() {
+        next.par_extend((0..n2).into_par_iter().map(|i| {
+          let a = cur[i]; let b = cur[i + n2];
+          // (1-r)*a + r*b  ==  a + r*(b-a)
+          P3B::<E>::add(a, P3B::<E>::mul(r, P3B::<E>::sub(b, a)))
+        }));
+      } else {
+        next.extend((0..n2).map(|i| {
+          let a = cur[i];
+          let b = cur[i + n2];
+          P3B::<E>::add(a, P3B::<E>::mul(r, P3B::<E>::sub(b, a)))
+        }));
+      }
       layers.push(next.clone());
       cur = next;
     }
@@ -131,7 +149,15 @@ where
     // Build Merkle trees per layer with Poseidon2 hashes
     use super::merkle_mle_pc::{Round, HashMleEvaluationArgument, TAG_LAYER_ROOTS};
     let trees: Vec<_> = layers.iter().map(|lvl| {
-      let leaves = lvl.par_iter().map(|x| super::merkle_mle_pc::leaf_digest::<E, P3B<E>>(x)).collect::<Vec<_>>();
+      let leaves = if crate::parallel::parallelism_enabled() {
+        lvl.par_iter()
+          .map(|x| super::merkle_mle_pc::leaf_digest::<E, P3B<E>>(x))
+          .collect::<Vec<_>>()
+      } else {
+        lvl.iter()
+          .map(|x| super::merkle_mle_pc::leaf_digest::<E, P3B<E>>(x))
+          .collect::<Vec<_>>()
+      };
       super::merkle_mle_pc::MerkleTree::from_leaves::<E, P3B<E>>(leaves)
     }).collect();
 

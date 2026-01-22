@@ -24,7 +24,6 @@ use num_integer::div_ceil;
 use rand_core::OsRng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
 use tracing::{info, info_span};
 
 type AffineGroupElement<E> = <<E as Engine>::GE as DlogGroup>::AffineGroupElement;

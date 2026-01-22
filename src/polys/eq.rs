@@ -61,10 +61,17 @@ impl<Scalar: PrimeField> EqPolynomial<Scalar> {
       let (evals_left, evals_right) = evals.split_at_mut(size);
       let (evals_right, _) = evals_right.split_at_mut(size);
 
-      zip_with_for_each!(par_iter_mut, (evals_left, evals_right), |x, y| {
-        *y = *x * r;
-        *x -= &*y;
-      });
+      if crate::parallel::parallelism_enabled() {
+        zip_with_for_each!(par_iter_mut, (evals_left, evals_right), |x, y| {
+          *y = *x * r;
+          *x -= &*y;
+        });
+      } else {
+        for (x, y) in evals_left.iter_mut().zip(evals_right.iter_mut()) {
+          *y = *x * r;
+          *x -= &*y;
+        }
+      }
 
       size *= 2;
     }

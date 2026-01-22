@@ -97,18 +97,32 @@ impl<F: PrimeField> SparseMatrix<F> {
   /// Multiply by a dense vector; uses rayon/gpu.
   /// This does not check that the shape of the matrix/vector are compatible.
   pub fn multiply_vec_unchecked(&self, vector: &[F]) -> Vec<F> {
-    self
-      .indptr
-      .par_windows(2)
-      .map(|ptrs| {
-        // par_windows(2) guarantees ptrs has exactly 2 elements
-        let row_ptrs = [ptrs[0], ptrs[1]];
-        self
-          .get_row_unchecked(&row_ptrs)
-          .map(|(val, col_idx)| *val * vector[*col_idx])
-          .sum()
-      })
-      .collect()
+    if crate::parallel::parallelism_enabled() {
+      self
+        .indptr
+        .par_windows(2)
+        .map(|ptrs| {
+          // par_windows(2) guarantees ptrs has exactly 2 elements
+          let row_ptrs = [ptrs[0], ptrs[1]];
+          self
+            .get_row_unchecked(&row_ptrs)
+            .map(|(val, col_idx)| *val * vector[*col_idx])
+            .sum()
+        })
+        .collect()
+    } else {
+      self
+        .indptr
+        .windows(2)
+        .map(|ptrs| {
+          let row_ptrs = [ptrs[0], ptrs[1]];
+          self
+            .get_row_unchecked(&row_ptrs)
+            .map(|(val, col_idx)| *val * vector[*col_idx])
+            .sum()
+        })
+        .collect()
+    }
   }
 
   /// returns a custom iterator

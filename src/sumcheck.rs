@@ -16,7 +16,6 @@ use crate::{
 use ff::Field;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
 use tracing::{info, info_span};
 
 /// 4 k elements is a good cut-off on a 16-core machine.
@@ -42,10 +41,9 @@ where
     return identity();
   }
 
-  // Are we *already* running inside a Rayon worker thread?
-  let in_rayon_ctx = rayon::current_thread_index().is_some();
+  let in_rayon_ctx = crate::parallel::in_rayon_ctx();
 
-  if len < PAR_THRESHOLD || in_rayon_ctx {
+  if !crate::parallel::parallelism_enabled() || len < PAR_THRESHOLD || in_rayon_ctx {
     // ---------- serial fallback ----------
     let mut acc = identity();
     for i in 0..len {
@@ -228,7 +226,7 @@ impl<E: Engine> SumcheckProof<E> {
 
       // bind all tables to the verifier's challenge
       let (_bind_span, bind_t) = start_span!("bind_poly_vars_quad");
-      rayon::join(
+      crate::parallel::join(
         || poly_A.bind_poly_var_top(&r_i),
         || poly_B.bind_poly_var_top(&r_i),
       );
@@ -301,15 +299,15 @@ impl<E: Engine> SumcheckProof<E> {
 
       // bind all tables to the verifier's challenge
       let (_bind_span, bind_t) = start_span!("bind_poly_vars_quad");
-      rayon::join(
+      crate::parallel::join(
         || {
-          rayon::join(
+          crate::parallel::join(
             || poly_A_0.bind_poly_var_top(&r_i),
             || poly_B_0.bind_poly_var_top(&r_i),
           )
         },
         || {
-          rayon::join(
+          crate::parallel::join(
             || poly_A_1.bind_poly_var_top(&r_i),
             || poly_B_1.bind_poly_var_top(&r_i),
           )
@@ -473,15 +471,15 @@ impl<E: Engine> SumcheckProof<E> {
 
       // bound all tables to the verifier's challenge
       let (_bind_span, bind_t) = start_span!("bind_poly_vars");
-      rayon::join(
+      crate::parallel::join(
         || {
-          rayon::join(
+          crate::parallel::join(
             || poly_A.bind_poly_var_top(&r_i),
             || poly_B.bind_poly_var_top(&r_i),
           )
         },
         || {
-          rayon::join(
+          crate::parallel::join(
             || poly_C.bind_poly_var_top(&r_i),
             || poly_D.bind_poly_var_top(&r_i),
           )
@@ -569,26 +567,26 @@ impl<E: Engine> SumcheckProof<E> {
 
       // bound all tables to the verifier's challenge
       let (_bind_span, bind_t) = start_span!("bind_poly_vars");
-      rayon::join(
+      crate::parallel::join(
         || {
-          rayon::join(
+          crate::parallel::join(
             || poly_A.bind_poly_var_top(&r_i),
             || poly_B_0.bind_poly_var_top(&r_i),
           );
         },
         || {
-          rayon::join(
+          crate::parallel::join(
             || {
-              rayon::join(
+              crate::parallel::join(
                 || poly_B_1.bind_poly_var_top(&r_i),
                 || poly_C_0.bind_poly_var_top(&r_i),
               );
             },
             || {
-              rayon::join(
+              crate::parallel::join(
                 || poly_C_1.bind_poly_var_top(&r_i),
                 || {
-                  rayon::join(
+                  crate::parallel::join(
                     || poly_D_0.bind_poly_var_top(&r_i),
                     || poly_D_1.bind_poly_var_top(&r_i),
                   );

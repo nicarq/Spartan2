@@ -248,14 +248,14 @@ impl PrimeField for F {
 }
 
 impl PrimeFieldBits for F {
-    type ReprBits = [u64; 1];
+    type ReprBits = [u8; 8];
 
     fn to_le_bits(&self) -> ff::FieldBits<Self::ReprBits> {
-        ff::FieldBits::new([self.0])
+        ff::FieldBits::new(self.to_repr())
     }
 
     fn char_le_bits() -> ff::FieldBits<Self::ReprBits> {
-        ff::FieldBits::new([GOLDILOCKS_MODULUS])
+        ff::FieldBits::new(GOLDILOCKS_MODULUS.to_le_bytes())
     }
 }
 

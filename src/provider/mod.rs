@@ -3,21 +3,30 @@
 // public modules to be used as an commitment engine with Spartan
 pub mod goldi;
 pub mod keccak;
-pub mod pasta;
 pub mod pcs;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod pasta;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod pt256;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod traits;
 
+#[cfg(not(target_arch = "wasm32"))]
 mod msm;
 
 use crate::{
   provider::{
     keccak::Keccak256Transcript,
-    pasta::{pallas, vesta},
-    pcs::{hyrax_pc::HyraxPCS, merkle_mle_pc::HashMlePCS},
-    pt256::{p256, t256},
+    pcs::merkle_mle_pc::HashMlePCS,
   },
   traits::Engine,
+};
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::provider::{
+  pasta::{pallas, vesta},
+  pcs::hyrax_pc::HyraxPCS,
+  pt256::{p256, t256},
 };
 
 #[cfg(feature = "p3_backend")]
@@ -26,21 +35,26 @@ use core::fmt::Debug;
 use serde::{Deserialize, Serialize};
 
 /// An implementation of the Spartan Engine trait with Pallas curve and Hyrax commitment scheme
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PallasHyraxEngine;
 
 /// An implementation of the Spartan Engine trait with Vesta curve and Hyrax commitment scheme
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VestaHyraxEngine;
 
 /// An implementation of the Spartan Engine trait with P256 curve and Hyrax commitment scheme
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct P256HyraxEngine;
 
 /// An implementation of the Spartan Engine trait with T256 curve and Hyrax commitment scheme
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct T256HyraxEngine;
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Engine for PallasHyraxEngine {
   type Base = pallas::Base;
   type Scalar = pallas::Scalar;
@@ -49,6 +63,7 @@ impl Engine for PallasHyraxEngine {
   type PCS = HyraxPCS<Self>;
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Engine for VestaHyraxEngine {
   type Base = vesta::Base;
   type Scalar = vesta::Scalar;
@@ -57,6 +72,7 @@ impl Engine for VestaHyraxEngine {
   type PCS = HyraxPCS<Self>;
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Engine for P256HyraxEngine {
   type Base = p256::Base;
   type Scalar = p256::Scalar;
@@ -65,6 +81,7 @@ impl Engine for P256HyraxEngine {
   type PCS = HyraxPCS<Self>;
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Engine for T256HyraxEngine {
   type Base = t256::Base;
   type Scalar = t256::Scalar;
@@ -74,21 +91,26 @@ impl Engine for T256HyraxEngine {
 }
 
 /// An implementation of the Spartan Engine trait with Pallas curve and Hash-MLE PCS (Keccak Merkle)
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PallasMerkleMleEngine;
 
 /// An implementation of the Spartan Engine trait with Vesta curve and Hash-MLE PCS
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VestaMerkleMleEngine;
 
 /// An implementation of the Spartan Engine trait with P256 curve and Hash-MLE PCS
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct P256MerkleMleEngine;
 
 /// An implementation of the Spartan Engine trait with T256 curve and Hash-MLE PCS
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct T256MerkleMleEngine;
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Engine for PallasMerkleMleEngine {
   type Base = pallas::Base;
   type Scalar = pallas::Scalar;
@@ -97,6 +119,7 @@ impl Engine for PallasMerkleMleEngine {
   type PCS = HashMlePCS<Self>;
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Engine for VestaMerkleMleEngine {
   type Base = vesta::Base;
   type Scalar = vesta::Scalar;
@@ -105,6 +128,7 @@ impl Engine for VestaMerkleMleEngine {
   type PCS = HashMlePCS<Self>;
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Engine for P256MerkleMleEngine {
   type Base = p256::Base;
   type Scalar = p256::Scalar;
@@ -113,6 +137,7 @@ impl Engine for P256MerkleMleEngine {
   type PCS = HashMlePCS<Self>;
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Engine for T256MerkleMleEngine {
   type Base = t256::Base;
   type Scalar = t256::Scalar;

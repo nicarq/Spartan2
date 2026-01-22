@@ -35,7 +35,6 @@ use ff::Field;
 use once_cell::sync::OnceCell;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
 use tracing::{debug, info, info_span};
 
 fn compute_tensor_decomp(n: usize) -> (usize, usize, usize) {
@@ -632,7 +631,7 @@ where
       "generate_instances_witnesses",
       step_circuits = step_circuits.len()
     );
-    let (res_steps, res_core) = rayon::join(
+    let (res_steps, res_core) = crate::parallel::join(
       || {
         prep_snark
           .ps_step
@@ -925,7 +924,7 @@ where
     info!(elapsed_ms = %sc2_t.elapsed().as_millis(), "inner_sumcheck (batched)");
 
     let (_eval_w_span, eval_w_t) = start_span!("evaluate_witnesses");
-    let (eval_W_step, eval_W_core) = rayon::join(
+    let (eval_W_step, eval_W_core) = crate::parallel::join(
       || MultilinearPolynomial::evaluate_with(&folded_W.W, &r_y[1..]),
       || MultilinearPolynomial::evaluate_with(&core_witness.W, &r_y[1..]),
     );
@@ -1154,7 +1153,7 @@ where
             .sum()
         };
 
-      let (T_x, T_y) = rayon::join(
+      let (T_x, T_y) = crate::parallel::join(
         || EqPolynomial::evals_from_points(r_x),
         || EqPolynomial::evals_from_points(r_y),
       );

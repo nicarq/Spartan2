@@ -15,7 +15,6 @@ use ff::Field;
 use once_cell::sync::OnceCell;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
 use tracing::{info, info_span};
 
 mod sparse;
@@ -158,11 +157,19 @@ impl<E: Engine> R1CSShape<E> {
     let num_cons_padded = self.num_cons.next_power_of_two();
 
     let apply_pad = |mut M: SparseMatrix<E::Scalar>| -> SparseMatrix<E::Scalar> {
-      M.indices.par_iter_mut().for_each(|c| {
-        if *c >= self.num_vars {
-          *c += num_vars_padded - self.num_vars
-        }
-      });
+      if crate::parallel::parallelism_enabled() {
+        M.indices.par_iter_mut().for_each(|c| {
+          if *c >= self.num_vars {
+            *c += num_vars_padded - self.num_vars
+          }
+        });
+      } else {
+        M.indices.iter_mut().for_each(|c| {
+          if *c >= self.num_vars {
+            *c += num_vars_padded - self.num_vars
+          }
+        });
+      }
 
       M.cols += num_vars_padded - self.num_vars;
 
@@ -261,9 +268,9 @@ impl<E: Engine> R1CSShape<E> {
       return Err(SpartanError::InvalidWitnessLength);
     }
 
-    let (Az, (Bz, Cz)) = rayon::join(
+    let (Az, (Bz, Cz)) = crate::parallel::join(
       || self.A.multiply_vec(z),
-      || rayon::join(|| self.B.multiply_vec(z), || self.C.multiply_vec(z)),
+      || crate::parallel::join(|| self.B.multiply_vec(z), || self.C.multiply_vec(z)),
     );
 
     Ok((Az?, Bz?, Cz?))
@@ -340,28 +347,40 @@ impl<E: Engine> R1CSWitness<E> {
       });
     }
 
-    let acc_W = (0..n)
-      .into_par_iter()
-      .fold(
-        || vec![E::Scalar::ZERO; dim],
-        |mut acc, i| {
-          let wi = w[i];
-          let Wi = &Ws[i].W;
-          for k in 0..dim {
-            acc[k] += wi * Wi[k];
-          }
-          acc
-        },
-      )
-      .reduce(
-        || vec![E::Scalar::ZERO; dim],
-        |mut a, b| {
-          for (ai, bi) in a.iter_mut().zip(b.iter()) {
-            *ai += *bi;
-          }
-          a
-        },
-      );
+    let acc_W = if crate::parallel::parallelism_enabled() {
+      (0..n)
+        .into_par_iter()
+        .fold(
+          || vec![E::Scalar::ZERO; dim],
+          |mut acc, i| {
+            let wi = w[i];
+            let Wi = &Ws[i].W;
+            for k in 0..dim {
+              acc[k] += wi * Wi[k];
+            }
+            acc
+          },
+        )
+        .reduce(
+          || vec![E::Scalar::ZERO; dim],
+          |mut a, b| {
+            for (ai, bi) in a.iter_mut().zip(b.iter()) {
+              *ai += *bi;
+            }
+            a
+          },
+        )
+    } else {
+      let mut acc = vec![E::Scalar::ZERO; dim];
+      for i in 0..n {
+        let wi = w[i];
+        let Wi = &Ws[i].W;
+        for k in 0..dim {
+          acc[k] += wi * Wi[k];
+        }
+      }
+      acc
+    };
 
     let acc_r = <E::PCS as FoldingEngineTrait<E>>::fold_blinds(
       &Ws.iter().map(|wz| wz.r_W.clone()).collect::<Vec<_>>(),
@@ -536,18 +555,30 @@ impl<E: Engine> SplitR1CSShape<E> {
     let num_cons_padded = num_cons.next_power_of_two();
 
     let apply_pad = |mut M: SparseMatrix<E::Scalar>| -> SparseMatrix<E::Scalar> {
-      M.indices.par_iter_mut().for_each(|c| {
-        if *c >= num_shared && *c < num_shared + num_precommitted {
-          // precommitted variables
-          *c += num_shared_padded - num_shared;
-        } else if *c >= num_shared + num_precommitted && *c < num_vars {
-          // rest of the variables
-          *c += num_shared_padded + num_precommitted_padded - num_shared - num_precommitted;
-        } else if *c >= num_vars {
-          // public and challenge variables
-          *c += num_vars_padded - num_vars;
-        }
-      });
+      if crate::parallel::parallelism_enabled() {
+        M.indices.par_iter_mut().for_each(|c| {
+          if *c >= num_shared && *c < num_shared + num_precommitted {
+            // precommitted variables
+            *c += num_shared_padded - num_shared;
+          } else if *c >= num_shared + num_precommitted && *c < num_vars {
+            // rest of the variables
+            *c += num_shared_padded + num_precommitted_padded - num_shared - num_precommitted;
+          } else if *c >= num_vars {
+            // public and challenge variables
+            *c += num_vars_padded - num_vars;
+          }
+        });
+      } else {
+        M.indices.iter_mut().for_each(|c| {
+          if *c >= num_shared && *c < num_shared + num_precommitted {
+            *c += num_shared_padded - num_shared;
+          } else if *c >= num_shared + num_precommitted && *c < num_vars {
+            *c += num_shared_padded + num_precommitted_padded - num_shared - num_precommitted;
+          } else if *c >= num_vars {
+            *c += num_vars_padded - num_vars;
+          }
+        });
+      }
 
       M.cols += num_vars_padded - num_vars;
 
@@ -600,12 +631,20 @@ impl<E: Engine> SplitR1CSShape<E> {
     S_B.num_cons = num_cons_padded;
 
     let move_public_vars = |M: &mut SparseMatrix<E::Scalar>, num_cons: usize, num_vars: usize| {
-      M.indices.par_iter_mut().for_each(|c| {
-        if *c >= num_vars {
-          // public and challenge variables
-          *c += num_vars_padded - num_vars;
-        }
-      });
+      if crate::parallel::parallelism_enabled() {
+        M.indices.par_iter_mut().for_each(|c| {
+          if *c >= num_vars {
+            // public and challenge variables
+            *c += num_vars_padded - num_vars;
+          }
+        });
+      } else {
+        M.indices.iter_mut().for_each(|c| {
+          if *c >= num_vars {
+            *c += num_vars_padded - num_vars;
+          }
+        });
+      }
 
       M.cols += num_vars_padded - num_vars;
 
@@ -727,9 +766,9 @@ impl<E: Engine> SplitR1CSShape<E> {
       return Err(SpartanError::InvalidWitnessLength);
     }
 
-    let (Az, (Bz, Cz)) = rayon::join(
+    let (Az, (Bz, Cz)) = crate::parallel::join(
       || self.A.multiply_vec(z),
-      || rayon::join(|| self.B.multiply_vec(z), || self.C.multiply_vec(z)),
+      || crate::parallel::join(|| self.B.multiply_vec(z), || self.C.multiply_vec(z)),
     );
 
     Ok((Az?, Bz?, Cz?))

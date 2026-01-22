@@ -74,10 +74,14 @@ impl<Scalar: PrimeField> UniPoly<Scalar> {
 
   /// Evaluates the polynomial at one.
   pub fn eval_at_one(&self) -> Scalar {
-    (0..self.coeffs.len())
-      .into_par_iter()
-      .map(|i| self.coeffs[i])
-      .sum()
+    if crate::parallel::parallelism_enabled() {
+      (0..self.coeffs.len())
+        .into_par_iter()
+        .map(|i| self.coeffs[i])
+        .sum()
+    } else {
+      self.coeffs.iter().copied().sum()
+    }
   }
 
   /// Evaluates the polynomial at a given point `r`.

@@ -10,7 +10,6 @@
 
 use crate::{
   errors::SpartanError,
-  polys::multilinear::MultilinearPolynomial,
   traits::{
     Engine,
     pcs::{CommitmentTrait, PCSEngineTrait},
@@ -212,29 +211,31 @@ pub fn node_digest<E: Engine, B: MleBackend<E>>(l: &Digest32, r: &Digest32) -> D
 /// Merkle tree implementation using configurable hash backends
 #[derive(Clone)]
 pub struct MerkleTree {
-  /// bottom layer (leaves), power of two
-  #[allow(dead_code)]
-  leaves: Vec<Digest32>,
-  layers: Vec<Vec<Digest32>>, // including leaves; layers[0] == leaves, layers.last()[0] == root
+  layers: Vec<Vec<Digest32>>, // layers[0] == leaves, layers.last()[0] == root
 }
 
 impl MerkleTree {
   /// Create a new Merkle tree from leaf digests using the specified backend
   pub fn from_leaves<E: Engine, B: MleBackend<E>>(leaves: Vec<Digest32>) -> Self {
     assert!(leaves.len().is_power_of_two());
-    let mut layers = Vec::new();
-    let mut cur = leaves.clone();
-    layers.push(cur.clone());
-    
-    while cur.len() > 1 {
-      cur = cur
-        .chunks_exact(2)
-        .map(|p| node_digest::<E, B>(&p[0], &p[1]))
-        .collect::<Vec<_>>();
-      layers.push(cur.clone());
+    let mut layers: Vec<Vec<Digest32>> = Vec::new();
+    layers.push(leaves);
+
+    while layers.last().unwrap().len() > 1 {
+      let cur = layers.last().unwrap();
+      let next = if cur.len() >= 4096 {
+        cur.par_chunks_exact(2)
+          .map(|p| node_digest::<E, B>(&p[0], &p[1]))
+          .collect::<Vec<_>>()
+      } else {
+        cur.chunks_exact(2)
+          .map(|p| node_digest::<E, B>(&p[0], &p[1]))
+          .collect::<Vec<_>>()
+      };
+      layers.push(next);
     }
-    
-    Self { leaves, layers }
+
+    Self { layers }
   }
   
   /// Get the root digest of the Merkle tree
@@ -289,14 +290,24 @@ impl MerkleTree {
 /// This follows the same logic as MultilinearPolynomial::bind_poly_var_top
 fn fold_layer<E: Engine>(v: &[E::Scalar], r: &E::Scalar) -> Vec<E::Scalar> {
   let n = v.len() / 2;
-  (0..n)
-    .into_par_iter()
-    .map(|i| {
-      let left = v[i];
-      let right = v[i + n];
-      left + *r * (right - left) // equivalent to (1-r)*left + r*right
-    })
-    .collect()
+  if crate::parallel::parallelism_enabled() {
+    (0..n)
+      .into_par_iter()
+      .map(|i| {
+        let left = v[i];
+        let right = v[i + n];
+        left + *r * (right - left) // equivalent to (1-r)*left + r*right
+      })
+      .collect()
+  } else {
+    (0..n)
+      .map(|i| {
+        let left = v[i];
+        let right = v[i + n];
+        left + *r * (right - left)
+      })
+      .collect()
+  }
 }
 
 /// Hash-based multilinear polynomial commitment scheme
@@ -348,14 +359,22 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePCS<E> {
     }
     
     // Base layer leaves (unmasked in LeakReduced mode)
-    let leaves = v
-      .par_iter()
-      .map(|x_ff| {
-        // Default backend uses E::Scalar directly
-        let x_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(x_ff);
-        leaf_digest::<E, DefaultBackend<E>>(&x_fe)
-      })
-      .collect::<Vec<_>>();
+    let leaves = if crate::parallel::parallelism_enabled() {
+      v.par_iter()
+        .map(|x_ff| {
+          // Default backend uses E::Scalar directly
+          let x_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(x_ff);
+          leaf_digest::<E, DefaultBackend<E>>(&x_fe)
+        })
+        .collect::<Vec<_>>()
+    } else {
+      v.iter()
+        .map(|x_ff| {
+          let x_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(x_ff);
+          leaf_digest::<E, DefaultBackend<E>>(&x_fe)
+        })
+        .collect::<Vec<_>>()
+    };
     let tree = MerkleTree::from_leaves::<E, DefaultBackend<E>>(leaves);
     let base_root = MerkleRoot(tree.root().0);
 
@@ -418,37 +437,46 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePCS<E> {
     
     transcript.absorb(b"poly_com", comm);
 
-    // Use the MultilinearPolynomial's own evaluation method to get the correct result
-    let mle = MultilinearPolynomial::new(poly.to_vec());
-    let expected_eval = mle.evaluate(point);
-
-    // For the PCS, we need to build the evaluation layers step by step
-    // following the same logic as MultilinearPolynomial
-    let mut current_poly = poly.to_vec();
-    let mut all_layers = vec![current_poly.clone()];
-    
-    // Build layers by binding variables one by one, following MultilinearPolynomial's approach
+    // Build the evaluation layers step by step following MultilinearPolynomial's binding logic.
+    // Avoid extra clones: all_layers owns each level.
+    let mut all_layers: Vec<Vec<E::Scalar>> = Vec::with_capacity(m + 1);
+    all_layers.push(poly.to_vec());
     for &r_i in point.iter() {
-      let next_layer = fold_layer::<E>(&current_poly, &r_i);
-      all_layers.push(next_layer.clone());
-      current_poly = next_layer;
+      let next_layer = fold_layer::<E>(all_layers.last().unwrap(), &r_i);
+      all_layers.push(next_layer);
     }
     debug_assert_eq!(all_layers.last().unwrap().len(), 1);
 
     // Build trees + roots (per-proof) and round proofs
-    let trees: Vec<MerkleTree> = all_layers
-      .par_iter()
-      .map(|lvl| {
-        let leaves = lvl
-          .par_iter()
-          .map(|x_ff| {
-            let x_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(x_ff);
-            leaf_digest::<E, DefaultBackend<E>>(&x_fe)
-          })
-          .collect();
-        MerkleTree::from_leaves::<E, DefaultBackend<E>>(leaves)
-      })
-      .collect();
+    let trees: Vec<MerkleTree> = if crate::parallel::parallelism_enabled() {
+      all_layers
+        .par_iter()
+        .map(|lvl| {
+          let leaves = lvl
+            .par_iter()
+            .map(|x_ff| {
+              let x_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(x_ff);
+              leaf_digest::<E, DefaultBackend<E>>(&x_fe)
+            })
+            .collect();
+          MerkleTree::from_leaves::<E, DefaultBackend<E>>(leaves)
+        })
+        .collect()
+    } else {
+      all_layers
+        .iter()
+        .map(|lvl| {
+          let leaves = lvl
+            .iter()
+            .map(|x_ff| {
+              let x_fe = <DefaultBackend<E> as MleBackend<E>>::fe_from_ff(x_ff);
+              leaf_digest::<E, DefaultBackend<E>>(&x_fe)
+            })
+            .collect();
+          MerkleTree::from_leaves::<E, DefaultBackend<E>>(leaves)
+        })
+        .collect()
+    };
 
     let layer_roots: Vec<MerkleRoot> = trees.iter().map(|t| MerkleRoot(t.root().0)).collect();
 
@@ -511,8 +539,16 @@ impl<E: Engine> PCSEngineTrait<E> for HashMlePCS<E> {
       rounds.push(Round { a, b, path_a, path_b, next, path_next });
     }
 
-    // eval in LeakReduced mode - should match the MultilinearPolynomial evaluation
-    let eval = expected_eval;
+    // eval in LeakReduced mode
+    let eval = all_layers.last().unwrap()[0];
+
+    // Cross-check evaluation against the reference MLE evaluator in debug builds.
+    #[cfg(debug_assertions)]
+    {
+      let expected_eval =
+        crate::polys::multilinear::MultilinearPolynomial::new(poly.to_vec()).evaluate(point);
+      debug_assert_eq!(eval, expected_eval);
+    }
 
     // Pack argument
     let arg = HashMleEvaluationArgument { layer_roots, rounds, samples };

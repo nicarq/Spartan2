@@ -7,7 +7,6 @@ use core::ops::Index;
 use ff::PrimeField;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
 use tracing::{info, info_span};
 
 /// A multilinear extension of a polynomial $Z(\cdot)$, denote it as $\tilde{Z}(x_1, ..., x_m)$
@@ -53,9 +52,15 @@ impl<Scalar: PrimeField> MultilinearPolynomial<Scalar> {
 
     let (left, right) = self.Z.split_at_mut(n);
 
-    zip_with_for_each!((left.par_iter_mut(), right.par_iter()), |a, b| {
-      *a += *r * (*b - *a);
-    });
+    if crate::parallel::parallelism_enabled() {
+      zip_with_for_each!((left.par_iter_mut(), right.par_iter()), |a, b| {
+        *a += *r * (*b - *a);
+      });
+    } else {
+      for (a, b) in left.iter_mut().zip(right.iter()) {
+        *a += *r * (*b - *a);
+      }
+    }
 
     self.Z.truncate(n);
   }
@@ -72,17 +77,29 @@ impl<Scalar: PrimeField> MultilinearPolynomial<Scalar> {
       L.len() * r_len
     );
 
-    (0..r_len)
-      .into_par_iter()
-      .map(|i| {
-        let mut acc = Scalar::ZERO;
-        for j in 0..L.len() {
-          // row-major: index = j * r_len + i
-          acc += L[j] * poly[j * r_len + i];
-        }
-        acc
-      })
-      .collect()
+    if crate::parallel::parallelism_enabled() {
+      (0..r_len)
+        .into_par_iter()
+        .map(|i| {
+          let mut acc = Scalar::ZERO;
+          for j in 0..L.len() {
+            // row-major: index = j * r_len + i
+            acc += L[j] * poly[j * r_len + i];
+          }
+          acc
+        })
+        .collect()
+    } else {
+      (0..r_len)
+        .map(|i| {
+          let mut acc = Scalar::ZERO;
+          for j in 0..L.len() {
+            acc += L[j] * poly[j * r_len + i];
+          }
+          acc
+        })
+        .collect()
+    }
   }
 
   /// Evaluates the polynomial at the given point.
@@ -94,11 +111,19 @@ impl<Scalar: PrimeField> MultilinearPolynomial<Scalar> {
     // r must have a value for each variable
     let chis = EqPolynomial::evals_from_points(r);
 
-    zip_with!(
-      (chis.into_par_iter(), self.Z.par_iter()),
-      |chi_i, Z_i| chi_i * Z_i
-    )
-    .sum()
+    if crate::parallel::parallelism_enabled() {
+      zip_with!(
+        (chis.into_par_iter(), self.Z.par_iter()),
+        |chi_i, Z_i| chi_i * Z_i
+      )
+      .sum()
+    } else {
+      chis
+        .iter()
+        .zip(self.Z.iter())
+        .map(|(chi_i, z_i)| *chi_i * *z_i)
+        .sum()
+    }
   }
 
   /// Evaluates the polynomial with the given evaluations and point.
@@ -106,14 +131,12 @@ impl<Scalar: PrimeField> MultilinearPolynomial<Scalar> {
     let (_eval_span, eval_t) =
       start_span!("multilinear_evaluate_with", vars = r.len(), evals = Z.len());
 
-    let result = zip_with!(
-      (
-        EqPolynomial::evals_from_points(r).into_par_iter(),
-        Z.par_iter()
-      ),
-      |a, b| a * b
-    )
-    .sum();
+    let evals = EqPolynomial::evals_from_points(r);
+    let result = if crate::parallel::parallelism_enabled() {
+      zip_with!((evals.into_par_iter(), Z.par_iter()), |a, b| a * b).sum()
+    } else {
+      evals.iter().zip(Z.iter()).map(|(a, b)| *a * *b).sum()
+    };
 
     info!(elapsed_ms = %eval_t.elapsed().as_millis(), vars = r.len(), evals = Z.len(), "multilinear_evaluate_with");
     result
@@ -170,7 +193,7 @@ impl<Scalar: PrimeField> SparsePolynomial<Scalar> {
       .sum();
 
     let common = (0..self.num_vars - 1 - num_vars_z)
-      .map(|i| (Scalar::ONE - r[i]))
+      .map(|i| Scalar::ONE - r[i])
       .product::<Scalar>();
 
     common * eval_partial

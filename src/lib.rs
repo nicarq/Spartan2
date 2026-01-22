@@ -16,10 +16,14 @@
 
 // private modules
 mod math;
+mod parallel;
 mod r1cs;
+mod time;
 
 #[macro_use]
 mod macros;
+
+pub(crate) use time::Instant;
 
 // public modules
 pub mod bellpepper;
@@ -38,7 +42,7 @@ macro_rules! start_span {
         let span       = info_span!($name $(, $($fmt)+)?);
         let span_clone = span.clone();    // lives as long as the guard
         let _guard      = span_clone.enter();
-        (span, Instant::now())
+        (span, $crate::Instant::now())
     }};
 }
 pub(crate) use start_span;
